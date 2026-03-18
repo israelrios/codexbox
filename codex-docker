@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+
+import argparse
+import ast
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+from typing import Iterable
+
+
+DEFAULT_IMAGE = "codex-docker:latest"
+BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+BASE_PATH_SEGMENTS = set(BASE_PATH.split(":"))
+EXCLUDED_MOUNT_PREFIXES = ("/usr", "/var")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Start a temporary Docker container in the current shell directory "
+            "and launch Codex in yolo mode."
+        )
+    )
+    parser.add_argument(
+        "--image",
+        default=DEFAULT_IMAGE,
+        help=f"Docker image to run or build (default: {DEFAULT_IMAGE})",
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Force a rebuild of the Docker image before launching.",
+    )
+    parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Do not build the Docker image automatically if it is missing.",
+    )
+    parser.add_argument(
+        "--print-command",
+        action="store_true",
+        help="Print the generated docker command before executing it.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the generated docker command and exit without running it.",
+    )
+    parser.add_argument(
+        "codex_args",
+        nargs=argparse.REMAINDER,
+        help="Arguments forwarded to codex. Prefix them with -- if needed.",
+    )
+    args = parser.parse_args()
+    if args.codex_args and args.codex_args[0] == "--":
+        args.codex_args = args.codex_args[1:]
+    return args
+
+
+def parse_writable_roots(config_path: Path) -> list[str]:
+    section_name = "[sandbox_workspace_write]"
+    in_section = False
+    collecting = False
+    roots: list[str] = []
+
+    with config_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+
+            if line.startswith("[") and line.endswith("]") and not collecting:
+                in_section = line == section_name
+                continue
+
+            if not in_section:
+                continue
+
+            if collecting:
+                if line == "]":
+                    collecting = False
+                    continue
+                roots.append(parse_toml_string(line.rstrip(",")))
+                continue
+
+            if not line.startswith("writable_roots"):
+                continue
+
+            _, value = line.split("=", 1)
+            value = value.strip()
+            if value == "[":
+                collecting = True
+                continue
+            if value.startswith("[") and value.endswith("]"):
+                inline_items = ast.literal_eval(value)
+                return [str(item) for item in inline_items]
+            raise ValueError(
+                "Unsupported writable_roots format in ~/.codex/config.toml"
+            )
+
+    if collecting:
+        raise ValueError("Unterminated writable_roots array in ~/.codex/config.toml")
+
+    return roots
+
+
+def parse_toml_string(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError("Empty writable root entry in ~/.codex/config.toml")
+    return ast.literal_eval(value)
+
+
+def ordered_unique(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def parse_env_output(output: bytes) -> dict[str, str]:
+    env_map: dict[str, str] = {}
+    for entry in output.split(b"\0"):
+        if not entry:
+            continue
+        key, value = entry.split(b"=", 1)
+        env_map[key.decode()] = value.decode()
+    return env_map
+
+
+def capture_shell_env(command: str, env: dict[str, str]) -> dict[str, str]:
+    completed = subprocess.run(
+        ["bash", "-lc", command],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise SystemExit(f"Failed to evaluate shell environment with command: {command}")
+    return parse_env_output(completed.stdout)
+
+
+def load_xsessionrc_env(home_dir: Path) -> dict[str, str]:
+    xsessionrc_path = home_dir / ".xsessionrc"
+    if not xsessionrc_path.is_file():
+        return {}
+
+    user_name = os.environ.get("USER") or home_dir.name
+    seed_env = {
+        "HOME": str(home_dir),
+        "LOGNAME": os.environ.get("LOGNAME") or user_name,
+        "PATH": BASE_PATH,
+        "SHELL": os.environ.get("SHELL") or "/bin/bash",
+        "USER": user_name,
+    }
+    before = capture_shell_env("env -0", seed_env)
+    after = capture_shell_env('source "$HOME/.xsessionrc" >/dev/null 2>&1; env -0', seed_env)
+
+    exports: dict[str, str] = {}
+    for key, value in after.items():
+        if before.get(key) != value:
+            exports[key] = value
+    return exports
+
+
+def shell_pwd() -> Path:
+    shell_pwd_value = os.environ.get("PWD")
+    if shell_pwd_value:
+        shell_pwd = Path(shell_pwd_value)
+        if shell_pwd.is_absolute():
+            return shell_pwd
+    return Path.cwd()
+
+
+def docker_tty_flags() -> list[str]:
+    flags: list[str] = []
+    if not sys.stdin.closed:
+        flags.append("-i")
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        flags.append("-t")
+    return flags
+
+
+def docker_env_flags(names: Iterable[str]) -> list[str]:
+    flags: list[str] = []
+    for name in ordered_unique(names):
+        flags.extend(["--env", name])
+    return flags
+
+
+def ensure_image(script_dir: Path, image: str, rebuild: bool, skip_build: bool) -> None:
+    inspect = subprocess.run(
+        ["docker", "image", "inspect", image],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if inspect.returncode == 0 and not rebuild:
+        return
+    if skip_build:
+        raise SystemExit(f"Docker image {image!r} was not found and --skip-build was used.")
+
+    build_cmd = ["docker", "build", "--pull", "--tag", image, str(script_dir)]
+    run_checked(build_cmd)
+
+
+def run_checked(command: list[str], env: dict[str, str] | None = None) -> None:
+    completed = subprocess.run(command, env=env, check=False)
+    if completed.returncode != 0:
+        raise SystemExit(completed.returncode)
+
+
+def path_tokens(value: str) -> list[str]:
+    tokens: list[str] = []
+    for part in re.split(r"[\s:]+", value):
+        if not part:
+            continue
+        for token in re.split(r"[=,;]", part):
+            cleaned = token.strip("\"'()[],")
+            if cleaned.startswith("/") and not cleaned.startswith("//"):
+                tokens.append(cleaned.rstrip("/") or "/")
+    return tokens
+
+
+def env_directory_refs(env_map: dict[str, str]) -> list[str]:
+    refs: list[str] = []
+    for key, value in env_map.items():
+        for token in path_tokens(value):
+            path = Path(token)
+            path_str = str(path)
+            if key == "PATH" and path_str in BASE_PATH_SEGMENTS:
+                continue
+            if path.is_dir() and not path_str.startswith(EXCLUDED_MOUNT_PREFIXES):
+                refs.append(str(path))
+    return ordered_unique(refs)
+
+
+def host_ca_setup() -> tuple[dict[str, str], list[str]]:
+    env_updates: dict[str, str] = {}
+    mount_paths: list[str] = []
+
+    cert_dir_candidates = [os.environ.get("SSL_CERT_DIR"), "/etc/ssl/certs"]
+    cert_dir = next(
+        (candidate for candidate in cert_dir_candidates if candidate and Path(candidate).is_dir()),
+        None,
+    )
+    cert_file_candidates = [
+        os.environ.get("SSL_CERT_FILE"),
+        "/etc/ssl/certs/ca-certificates.crt",
+    ]
+    cert_file = next(
+        (candidate for candidate in cert_file_candidates if candidate and Path(candidate).is_file()),
+        None,
+    )
+
+    if cert_dir:
+        env_updates["SSL_CERT_DIR"] = cert_dir
+        mount_paths.append(cert_dir)
+    if cert_file:
+        env_updates["CURL_CA_BUNDLE"] = cert_file
+        env_updates["GIT_SSL_CAINFO"] = cert_file
+        env_updates["NODE_EXTRA_CA_CERTS"] = cert_file
+        env_updates["REQUESTS_CA_BUNDLE"] = cert_file
+        env_updates["SSL_CERT_FILE"] = cert_file
+
+    return env_updates, ordered_unique(mount_paths)
+
+
+def is_same_or_parent(parent: str, child: str) -> bool:
+    try:
+        Path(child).relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def merge_mount_specs(specs: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
+    ordered_specs: list[tuple[str, str]] = []
+    for path, mode in specs:
+        if mode == "ro" and any(
+            existing_mode == "rw" and is_same_or_parent(existing_path, path)
+            for existing_path, existing_mode in ordered_specs
+        ):
+            continue
+
+        updated = False
+        for index, (existing_path, existing_mode) in enumerate(ordered_specs):
+            if existing_path != path:
+                continue
+            if existing_mode == "ro" and mode == "rw":
+                ordered_specs[index] = (path, "rw")
+            updated = True
+            break
+        if not updated:
+            ordered_specs.append((path, mode))
+    return ordered_specs
+
+
+def main() -> None:
+    args = parse_args()
+    script_dir = Path(__file__).resolve().parent
+    home_dir = Path.home()
+    codex_dir = home_dir / ".codex"
+    config_path = codex_dir / "config.toml"
+    cwd = shell_pwd()
+
+    if not config_path.is_file():
+        raise SystemExit(f"Missing Codex config: {config_path}")
+    if not cwd.is_dir():
+        raise SystemExit(f"Current directory does not exist: {cwd}")
+    if not codex_dir.is_dir():
+        raise SystemExit(f"Missing Codex directory: {codex_dir}")
+
+    xsessionrc_env = load_xsessionrc_env(home_dir)
+    writable_roots = parse_writable_roots(config_path)
+    existing_roots: list[str] = []
+    missing_roots: list[str] = []
+    for root in writable_roots:
+        path = Path(os.path.expanduser(root))
+        if path.is_dir():
+            existing_roots.append(str(path))
+        else:
+            missing_roots.append(str(path))
+    existing_roots = ordered_unique(existing_roots)
+
+    if missing_roots:
+        print(
+            "Warning: skipping missing writable_roots from ~/.codex/config.toml:",
+            file=sys.stderr,
+        )
+        for root in missing_roots:
+            print(f"  - {root}", file=sys.stderr)
+
+    xsessionrc_dirs = env_directory_refs(xsessionrc_env)
+    ca_env, ca_mount_paths = host_ca_setup()
+    launch_env = os.environ.copy()
+    launch_env.update(xsessionrc_env)
+    launch_env.update(ca_env)
+    launch_env["HOME"] = str(home_dir)
+    launch_env["PWD"] = str(cwd)
+    for key in ("TERM", "COLORTERM"):
+        value = os.environ.get(key)
+        if value:
+            launch_env[key] = value
+
+    env_names = ordered_unique(
+        [
+            "HOME",
+            "PWD",
+            "TERM",
+            "COLORTERM",
+            *xsessionrc_env.keys(),
+            *ca_env.keys(),
+        ]
+    )
+    mount_specs = merge_mount_specs(
+        [
+            (str(cwd), "rw"),
+            (str(codex_dir), "rw"),
+            *((path, "rw") for path in existing_roots),
+            *((path, "ro") for path in xsessionrc_dirs),
+            *((path, "ro") for path in ca_mount_paths),
+        ]
+    )
+    docker_cmd: list[str] = [
+        "docker",
+        "run",
+        "--rm",
+        "--init",
+        *docker_tty_flags(),
+        "--user",
+        f"{os.getuid()}:{os.getgid()}",
+        *docker_env_flags(env_names),
+        "--workdir",
+        str(cwd),
+    ]
+    for path, mode in mount_specs:
+        mount_spec = f"{path}:{path}"
+        if mode == "ro":
+            mount_spec = f"{mount_spec}:ro"
+        docker_cmd.extend(["-v", mount_spec])
+
+    docker_cmd.append(args.image)
+    docker_cmd.extend(
+        [
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-C",
+            str(cwd),
+        ]
+    )
+    for root in ordered_unique(existing_roots):
+        if root == str(cwd):
+            continue
+        docker_cmd.extend(["--add-dir", root])
+    docker_cmd.extend(args.codex_args)
+
+    if args.print_command or args.dry_run:
+        print(shlex.join(docker_cmd))
+
+    if args.dry_run:
+        return
+
+    ensure_image(script_dir, args.image, args.rebuild, args.skip_build)
+    run_checked(docker_cmd, env=launch_env)
+
+
+if __name__ == "__main__":
+    main()
