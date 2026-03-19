@@ -27,6 +27,7 @@ RUN apt-get update \
         python3-pytest \
         procps \
         ripgrep \
+        slirp4netns \
         uidmap \
     && rm -rf /var/lib/apt/lists/*
 
