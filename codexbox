@@ -32,6 +32,8 @@ PODMAN_AUTO_MOUNT_RELATIVE_DIRS = (
     ".config/containers",
 )
 GITCONFIG_RELATIVE_PATH = ".gitconfig"
+GITHUB_CLI_CONFIG_RELATIVE_DIR = ".config/gh"
+GITLAB_CLI_CONFIG_RELATIVE_DIR = ".config/glab-cli"
 
 
 @dataclass(frozen=True)
@@ -533,6 +535,20 @@ def host_gitconfig_mount_paths(home_dir: Path) -> list[str]:
     return [str(gitconfig_path)]
 
 
+def host_github_cli_mount_paths(home_dir: Path) -> list[str]:
+    gh_config_dir = home_dir / GITHUB_CLI_CONFIG_RELATIVE_DIR
+    if not gh_config_dir.is_dir():
+        return []
+    return [str(gh_config_dir)]
+
+
+def host_gitlab_cli_mount_paths(home_dir: Path) -> list[str]:
+    glab_config_dir = home_dir / GITLAB_CLI_CONFIG_RELATIVE_DIR
+    if not glab_config_dir.is_dir():
+        return []
+    return [str(glab_config_dir)]
+
+
 def is_same_or_parent(parent: str, child: str) -> bool:
     try:
         _ = Path(child).relative_to(parent)
@@ -693,6 +709,8 @@ def main() -> None:
     ca_env, ca_mount_paths = host_ca_setup()
     podman_mount_paths = host_podman_mount_paths(home_dir)
     gitconfig_mount_paths = host_gitconfig_mount_paths(home_dir)
+    github_cli_mount_paths = host_github_cli_mount_paths(home_dir)
+    gitlab_cli_mount_paths = host_gitlab_cli_mount_paths(home_dir)
     forwarded_env = dict(shell_env)
     forwarded_env.update(ca_env)
     forwarded_env["HOME"] = str(home_dir)
@@ -706,6 +724,8 @@ def main() -> None:
             *((path, "rw") for path in existing_roots),
             *((path, "rw") for path in podman_mount_paths),
             *((path, "ro") for path in gitconfig_mount_paths),
+            *((path, "ro") for path in github_cli_mount_paths),
+            *((path, "ro") for path in gitlab_cli_mount_paths),
             *((path, "ro") for path in ca_mount_paths),
         ]
     )

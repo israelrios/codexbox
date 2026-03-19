@@ -6,11 +6,14 @@
 
 - Uses the local `podman` CLI to build and run the container.
 - Installs `podman` and `podman-docker` in the image, so both `podman` and Docker-compatible `docker` commands are available inside the container.
+- Installs `gh` and `glab` in the image for GitHub and GitLab CLI workflows.
 - Installs Python 3, `pip`, `pytest`, and `basedpyright` in the image.
 - Uses the current shell `PWD` as the container working directory.
 - Maps the current directory into the container at the same absolute path.
 - Maps `~/.codex` into the container at the same absolute path.
 - Maps `~/.gitconfig` into the container read-only when it exists on the host.
+- Maps `~/.config/gh` into the container read-only when it exists on the host.
+- Maps `~/.config/glab-cli` into the container read-only when it exists on the host.
 - Maps `~/.local/share/containers` and `~/.config/containers` into the container when those directories exist on the host.
 - Maps each existing path listed in `sandbox_workspace_write.writable_roots` from `~/.codex/config.toml`.
 - Forwards the invoking shell environment into the container, excluding keys matched by `vars-to-ignore.txt`.
