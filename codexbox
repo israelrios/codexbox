@@ -23,11 +23,15 @@ BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 BASE_PATH_SEGMENTS = set(BASE_PATH.split(":"))
 EXCLUDED_MOUNT_PREFIXES = ("/usr", "/var")
 PROFILE_SCRIPT_CONTAINER_PATH = "/etc/profile.d/codex-forwarded-path.sh"
+PODMAN_STORAGE_CONF_CONTAINER_PATH = "/etc/containers/codexbox-storage.conf"
+FUSE_DEVICE_PATH = "/dev/fuse"
+FUSE_OVERLAYFS_PATH = "/usr/bin/fuse-overlayfs"
 APPROVALS_CONFIG_FILE = ".codexbox-conf.json"
 PODMAN_AUTO_MOUNT_RELATIVE_DIRS = (
     ".local/share/containers",
     ".config/containers",
 )
+GITCONFIG_RELATIVE_PATH = ".gitconfig"
 
 
 @dataclass(frozen=True)
@@ -431,6 +435,56 @@ def write_path_profile(script_path: Path, forwarded_path: str) -> None:
     _ = script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def write_podman_storage_conf(config_path: Path, use_fuse_overlayfs: bool) -> None:
+    # Nested Podman runs on top of the outer container filesystem. Prefer
+    # fuse-overlayfs when the binary and /dev/fuse are available, otherwise
+    # fall back to vfs to avoid overlay-on-overlay failures.
+    driver = "overlay" if use_fuse_overlayfs else "vfs"
+    lines = [
+        "[storage]",
+        f'driver = "{driver}"',
+        'graphroot = "/var/lib/containers/storage"',
+        'runroot = "/run/containers/storage"',
+    ]
+    if use_fuse_overlayfs:
+        lines.extend(
+            [
+                "",
+                "[storage.options.overlay]",
+                f'mount_program = "{FUSE_OVERLAYFS_PATH}"',
+            ]
+        )
+    _ = config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def host_fuse_device_available() -> bool:
+    try:
+        device_stat = Path(FUSE_DEVICE_PATH).stat()
+    except OSError:
+        return False
+    return stat.S_ISCHR(device_stat.st_mode)
+
+
+def image_has_fuse_overlayfs(image: str, runtime_env: dict[str, str]) -> bool:
+    completed = subprocess.run(
+        [
+            CONTAINER_RUNTIME,
+            "run",
+            "--rm",
+            "--entrypoint",
+            "sh",
+            image,
+            "-c",
+            f"test -x {shlex.quote(FUSE_OVERLAYFS_PATH)}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=runtime_env,
+        check=False,
+    )
+    return completed.returncode == 0
+
+
 def host_ca_setup() -> tuple[dict[str, str], list[str]]:
     env_updates: dict[str, str] = {}
     mount_paths: list[str] = []
@@ -470,6 +524,13 @@ def host_podman_mount_paths(home_dir: Path) -> list[str]:
             if path.is_dir()
         ]
     )
+
+
+def host_gitconfig_mount_paths(home_dir: Path) -> list[str]:
+    gitconfig_path = home_dir / GITCONFIG_RELATIVE_PATH
+    if not gitconfig_path.is_file():
+        return []
+    return [str(gitconfig_path)]
 
 
 def is_same_or_parent(parent: str, child: str) -> bool:
@@ -609,6 +670,10 @@ def main() -> None:
             args.skip_build,
             runtime_env,
         )
+    use_fuse_overlayfs = host_fuse_device_available() and image_has_fuse_overlayfs(
+        args.image,
+        runtime_env,
+    )
 
     shell_env = filtered_shell_env(ignore_path)
     writable_roots = parse_writable_roots(config_path)
@@ -627,6 +692,7 @@ def main() -> None:
     env_candidates = env_mount_candidates(directory_env_map)
     ca_env, ca_mount_paths = host_ca_setup()
     podman_mount_paths = host_podman_mount_paths(home_dir)
+    gitconfig_mount_paths = host_gitconfig_mount_paths(home_dir)
     forwarded_env = dict(shell_env)
     forwarded_env.update(ca_env)
     forwarded_env["HOME"] = str(home_dir)
@@ -639,6 +705,7 @@ def main() -> None:
             (str(codex_dir), "rw"),
             *((path, "rw") for path in existing_roots),
             *((path, "rw") for path in podman_mount_paths),
+            *((path, "ro") for path in gitconfig_mount_paths),
             *((path, "ro") for path in ca_mount_paths),
         ]
     )
@@ -689,7 +756,10 @@ def main() -> None:
     )
     with tempfile.TemporaryDirectory(prefix="codexbox-") as temp_dir:
         path_profile = Path(temp_dir) / "codex-forwarded-path.sh"
+        podman_storage_conf = Path(temp_dir) / "codexbox-storage.conf"
         write_path_profile(path_profile, current_path)
+        write_podman_storage_conf(podman_storage_conf, use_fuse_overlayfs)
+        forwarded_env["CONTAINERS_STORAGE_CONF"] = PODMAN_STORAGE_CONF_CONTAINER_PATH
 
         container_cmd: list[str] = [
             CONTAINER_RUNTIME,
@@ -703,6 +773,8 @@ def main() -> None:
             "--workdir",
             str(cwd),
         ]
+        if use_fuse_overlayfs:
+            container_cmd.extend(["--device", FUSE_DEVICE_PATH])
         for path, mode in mount_specs:
             mount_spec = f"{path}:{path}"
             if mode == "ro":
@@ -712,6 +784,8 @@ def main() -> None:
             [
                 "-v",
                 f"{path_profile}:{PROFILE_SCRIPT_CONTAINER_PATH}:ro",
+                "-v",
+                f"{podman_storage_conf}:{PODMAN_STORAGE_CONF_CONTAINER_PATH}:ro",
             ]
         )
 
