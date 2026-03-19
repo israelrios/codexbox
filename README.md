@@ -5,7 +5,7 @@
 ## Behavior
 
 - Installs the Docker CLI in the image.
-- Installs Python 3, `pip`, and `pytest` in the image.
+- Installs Python 3, `pip`, `pytest`, and `basedpyright` in the image.
 - Uses the current shell `PWD` as the container working directory.
 - Maps the current directory into the container at the same absolute path.
 - Maps `~/.codex` into the container at the same absolute path.

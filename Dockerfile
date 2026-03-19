@@ -24,6 +24,6 @@ RUN apt-get update \
         ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install --global @openai/codex@latest
+RUN npm install --global @openai/codex@latest basedpyright
 
 ENTRYPOINT ["codex"]
