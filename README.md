@@ -17,6 +17,7 @@
 - Maps `~/.config/glab-cli` into the container read-only when it exists on the host.
 - Maps `~/.cache/containers`, `~/.local/share/containers`, and `~/.config/containers` into the container when those directories exist on the host.
 - Reuses the host rootless Podman image store as a read-only additional image store for nested Podman when the host store uses `overlay` and nested `fuse-overlayfs` is available.
+- Syncs new nested Podman images and newly added tags back to the host Podman store when the session exits. Use `--no-sync-images` to disable this.
 - Maps each existing path listed in `sandbox_workspace_write.writable_roots` from `~/.codex/config.toml`.
 - Forwards the invoking shell environment into the container, excluding keys matched by `vars-to-ignore.txt`.
 - Forwards the invoking shell's current `PATH` and prepends it to the image `PATH`.
@@ -58,6 +59,12 @@ Print the command without running anything:
 
 ```bash
 ./codexbox --dry-run
+```
+
+Disable host image sync for a session:
+
+```bash
+./codexbox --no-sync-images
 ```
 
 Force an image rebuild:

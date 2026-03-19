@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
+from codexbox_image_sync import import_image_sync_actions, internal_sync_session_main
+
 
 CONTAINER_RUNTIME = "podman"
 DEFAULT_IMAGE = "codexbox:latest"
@@ -27,6 +29,9 @@ PODMAN_STORAGE_CONF_CONTAINER_PATH = "/etc/containers/codexbox-storage.conf"
 FUSE_DEVICE_PATH = "/dev/fuse"
 FUSE_OVERLAYFS_PATH = "/usr/bin/fuse-overlayfs"
 APPROVALS_CONFIG_FILE = ".codexbox-conf.json"
+IMAGE_SYNC_HELPER_CONTAINER_PATH = "/tmp/codexbox-image-sync-helper.py"
+IMAGE_SYNC_DIR_CONTAINER_PATH = "/tmp/codexbox-image-sync"
+IMAGE_SYNC_MODULE_CONTAINER_PATH = "/tmp/codexbox_image_sync.py"
 PODMAN_AUTO_MOUNT_RELATIVE_DIRS = (
     ".cache/containers",
     ".local/share/containers",
@@ -59,6 +64,31 @@ class HostPodmanStore:
     image_store: str
 
 
+@dataclass(frozen=True)
+class LauncherPaths:
+    script_path: Path
+    script_dir: Path
+    sync_module_path: Path
+    home_dir: Path
+    codex_dir: Path
+    config_path: Path
+    approvals_path: Path
+    ignore_path: Path
+    cwd: Path
+
+
+@dataclass
+class LauncherContext:
+    runtime_env: dict[str, str]
+    use_fuse_overlayfs: bool
+    existing_roots: list[str]
+    env_candidates: list[EnvMountCandidate]
+    current_path: str
+    forwarded_env: dict[str, str]
+    base_mount_specs: list[tuple[str, str]]
+    podman_additional_image_store: str | None
+
+
 @dataclass
 class ParsedArgs(argparse.Namespace):
     image: str = DEFAULT_IMAGE
@@ -66,6 +96,7 @@ class ParsedArgs(argparse.Namespace):
     skip_build: bool = False
     print_command: bool = False
     dry_run: bool = False
+    sync_images: bool = True
     codex_args: list[str] = field(default_factory=list)
 
 
@@ -102,6 +133,15 @@ def parse_args() -> ParsedArgs:
         help="Print the generated podman command and exit without running it.",
     )
     _ = parser.add_argument(
+        "--sync-images",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Sync images created by nested Podman back to the host store when "
+            "the session exits (default: enabled)."
+        ),
+    )
+    _ = parser.add_argument(
         "codex_args",
         nargs=argparse.REMAINDER,
         help="Arguments forwarded to codex. Prefix them with -- if needed.",
@@ -116,7 +156,7 @@ def require_string_list(value: object, context: str) -> list[str]:
     if not isinstance(value, list):
         raise ValueError(f"Expected {context} to be a list of strings")
 
-    raw_items = value
+    raw_items = cast(list[object], value)
     items: list[str] = []
     for item in raw_items:
         if not isinstance(item, str):
@@ -141,7 +181,7 @@ def require_string_key_dict(value: object, context: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError(f"Expected {context} to be a JSON object")
 
-    raw_items = value
+    raw_items = cast(dict[object, object], value)
     result: dict[str, object] = {}
     for key, item in raw_items.items():
         if not isinstance(key, str):
@@ -284,8 +324,8 @@ def container_env_flags(env_map: dict[str, str]) -> list[str]:
 
 def podman_runtime_env() -> dict[str, str]:
     env_map = dict(os.environ)
-    env_map.pop("CONTAINER_CONNECTION", None)
-    env_map.pop("CONTAINER_HOST", None)
+    _ = env_map.pop("CONTAINER_CONNECTION", None)
+    _ = env_map.pop("CONTAINER_HOST", None)
     # Rootless Podman maps container root back to the invoking host user by default.
     env_map["PODMAN_USERNS"] = ""
     return env_map
@@ -334,8 +374,7 @@ def ensure_rootless_podman(podman_info: dict[str, object]) -> None:
 
     if not rootless:
         raise SystemExit(
-            "This launcher requires rootless Podman so container root maps back "
-            "to the invoking host user."
+            "This launcher requires rootless Podman so container root maps back to the invoking host user."
         )
 
 
@@ -397,6 +436,320 @@ def run_checked(command: list[str], env: dict[str, str] | None = None) -> None:
     completed = subprocess.run(command, env=env, check=False)
     if completed.returncode != 0:
         raise SystemExit(completed.returncode)
+
+
+def run_command(command: list[str], env: dict[str, str] | None = None) -> int:
+    completed = subprocess.run(command, env=env, check=False)
+    return completed.returncode
+
+
+def build_launcher_paths(script_path: Path) -> LauncherPaths:
+    resolved_script_path = script_path.resolve()
+    script_dir = resolved_script_path.parent
+    home_dir = Path.home()
+    codex_dir = home_dir / ".codex"
+    return LauncherPaths(
+        script_path=resolved_script_path,
+        script_dir=script_dir,
+        sync_module_path=script_dir / "codexbox_image_sync.py",
+        home_dir=home_dir,
+        codex_dir=codex_dir,
+        config_path=codex_dir / "config.toml",
+        approvals_path=home_dir / APPROVALS_CONFIG_FILE,
+        ignore_path=script_dir / "vars-to-ignore.txt",
+        cwd=shell_pwd(),
+    )
+
+
+def validate_launcher_paths(paths: LauncherPaths) -> None:
+    if not paths.config_path.is_file():
+        raise SystemExit(f"Missing Codex config: {paths.config_path}")
+    if not paths.cwd.is_dir():
+        raise SystemExit(f"Current directory does not exist: {paths.cwd}")
+    if not paths.codex_dir.is_dir():
+        raise SystemExit(f"Missing Codex directory: {paths.codex_dir}")
+    if not paths.sync_module_path.is_file():
+        raise SystemExit(f"Missing image sync module: {paths.sync_module_path}")
+
+
+def resolve_existing_roots(config_path: Path) -> list[str]:
+    existing_roots: list[str] = []
+    for root in parse_writable_roots(config_path):
+        path = Path(os.path.expanduser(root))
+        if path.is_dir():
+            existing_roots.append(str(path))
+    return ordered_unique(existing_roots)
+
+
+def prepare_launcher_context(args: ParsedArgs, paths: LauncherPaths) -> LauncherContext:
+    runtime_env = podman_runtime_env()
+    podman_info = load_podman_info(runtime_env)
+    ensure_rootless_podman(podman_info)
+
+    if not args.dry_run:
+        ensure_image(
+            paths.script_dir,
+            args.image,
+            args.rebuild,
+            args.skip_build,
+            runtime_env,
+        )
+    use_fuse_overlayfs = host_fuse_device_available() and image_has_fuse_overlayfs(
+        args.image,
+        runtime_env,
+    )
+
+    shell_env = filtered_shell_env(paths.ignore_path)
+    existing_roots = resolve_existing_roots(paths.config_path)
+    current_path = shell_env.get("PATH", os.environ.get("PATH", BASE_PATH))
+    container_path = image_env(args.image, runtime_env).get("PATH", BASE_PATH)
+    forwarded_path = merge_path_values(current_path, container_path)
+    directory_env_map = dict(shell_env)
+    directory_env_map["PATH"] = current_path
+    env_candidates = env_mount_candidates(directory_env_map)
+    ca_env, ca_mount_paths = host_ca_setup()
+    podman_mount_paths = host_podman_mount_paths(paths.home_dir)
+    podman_additional_image_store = host_podman_additional_image_store(
+        podman_info,
+        paths.home_dir,
+        use_fuse_overlayfs,
+    )
+    gitconfig_mount_paths = host_gitconfig_mount_paths(paths.home_dir)
+    github_cli_mount_paths = host_github_cli_mount_paths(paths.home_dir)
+    gitlab_cli_mount_paths = host_gitlab_cli_mount_paths(paths.home_dir)
+    forwarded_env = dict(shell_env)
+    forwarded_env.update(ca_env)
+    forwarded_env["HOME"] = str(paths.home_dir)
+    forwarded_env["PWD"] = str(paths.cwd)
+    forwarded_env["PATH"] = forwarded_path
+    forwarded_env["BASH_ENV"] = PROFILE_SCRIPT_CONTAINER_PATH
+    # The container runs as root. Keep USER/LOGNAME aligned with the actual
+    # in-container identity so nested rootless Podman resolves subuid/subgid
+    # entries for root instead of a forwarded host username.
+    forwarded_env["USER"] = "root"
+    forwarded_env["LOGNAME"] = "root"
+    # Nested rootless Podman cannot reliably mount proc through the OCI
+    # runtime in this container, so prefer chroot isolation for build steps
+    # unless the caller explicitly chose another mode.
+    _ = forwarded_env.setdefault("BUILDAH_ISOLATION", "chroot")
+    base_mount_specs = merge_mount_specs(
+        [
+            (str(paths.cwd), "rw"),
+            (str(paths.codex_dir), "rw"),
+            *((path, "rw") for path in existing_roots),
+            *((path, "rw") for path in podman_mount_paths),
+            *(
+                [(podman_additional_image_store, "ro")]
+                if podman_additional_image_store
+                else []
+            ),
+            *((path, "ro") for path in gitconfig_mount_paths),
+            *((path, "ro") for path in github_cli_mount_paths),
+            *((path, "ro") for path in gitlab_cli_mount_paths),
+            *((path, "ro") for path in ca_mount_paths),
+        ]
+    )
+    return LauncherContext(
+        runtime_env=runtime_env,
+        use_fuse_overlayfs=use_fuse_overlayfs,
+        existing_roots=existing_roots,
+        env_candidates=env_candidates,
+        current_path=current_path,
+        forwarded_env=forwarded_env,
+        base_mount_specs=base_mount_specs,
+        podman_additional_image_store=podman_additional_image_store,
+    )
+
+
+def report_blocked_home_candidates(candidates: list[EnvMountCandidate]) -> None:
+    if not candidates:
+        return
+
+    print(
+        "Skipping env-var-derived mounts of the home directory root:",
+        file=sys.stderr,
+    )
+    for candidate in candidates:
+        env_vars = ", ".join(candidate.env_vars)
+        print(f"  - {candidate.path} (from {env_vars})", file=sys.stderr)
+
+
+def resolve_mount_specs(paths: LauncherPaths, context: LauncherContext) -> list[tuple[str, str]]:
+    saved_approvals = load_env_mount_approvals(paths.approvals_path)
+    home_resolved = str(paths.home_dir.resolve())
+    current_approved_specs = merge_mount_specs(
+        [
+            *context.base_mount_specs,
+            *(
+                (candidate.path, "ro")
+                for candidate in context.env_candidates
+                if candidate.path in saved_approvals and candidate.resolved_path != home_resolved
+            ),
+        ]
+    )
+    blocked_home_candidates: list[EnvMountCandidate] = []
+    pending_candidates: list[EnvMountCandidate] = []
+    approved_env_paths: list[str] = []
+
+    for candidate in context.env_candidates:
+        if is_covered_by_mounts(candidate.path, context.base_mount_specs):
+            continue
+        if candidate.resolved_path == home_resolved:
+            blocked_home_candidates.append(candidate)
+            continue
+        if is_covered_by_mounts(candidate.path, current_approved_specs):
+            if candidate.path in saved_approvals:
+                approved_env_paths.append(candidate.path)
+            continue
+        pending_candidates.append(candidate)
+
+    report_blocked_home_candidates(blocked_home_candidates)
+    newly_approved_paths = confirm_env_mount_candidates(paths.approvals_path, pending_candidates)
+    return merge_mount_specs(
+        [
+            *context.base_mount_specs,
+            *((path, "ro") for path in approved_env_paths),
+            *((path, "ro") for path in sorted(newly_approved_paths)),
+        ]
+    )
+
+
+def build_container_command(
+    args: ParsedArgs,
+    paths: LauncherPaths,
+    context: LauncherContext,
+    mount_specs: list[tuple[str, str]],
+    path_profile: Path,
+    podman_storage_conf: Path,
+    image_sync_dir: Path,
+) -> list[str]:
+    forwarded_env = dict(context.forwarded_env)
+    forwarded_env["CONTAINERS_STORAGE_CONF"] = PODMAN_STORAGE_CONF_CONTAINER_PATH
+
+    container_cmd: list[str] = [
+        CONTAINER_RUNTIME,
+        "run",
+        "--rm",
+        "--init",
+        "--network",
+        "host",
+        *container_tty_flags(),
+        *container_env_flags(forwarded_env),
+        "--workdir",
+        str(paths.cwd),
+    ]
+    if context.use_fuse_overlayfs:
+        container_cmd.extend(["--device", FUSE_DEVICE_PATH])
+    for path, mode in mount_specs:
+        mount_spec = f"{path}:{path}"
+        if mode == "ro":
+            mount_spec = f"{mount_spec}:ro"
+        container_cmd.extend(["-v", mount_spec])
+    container_cmd.extend(
+        [
+            "-v",
+            f"{path_profile}:{PROFILE_SCRIPT_CONTAINER_PATH}:ro",
+            "-v",
+            f"{podman_storage_conf}:{PODMAN_STORAGE_CONF_CONTAINER_PATH}:ro",
+        ]
+    )
+    if args.sync_images:
+        container_cmd.extend(
+            [
+                "-v",
+                f"{paths.script_path}:{IMAGE_SYNC_HELPER_CONTAINER_PATH}:ro",
+                "-v",
+                f"{paths.sync_module_path}:{IMAGE_SYNC_MODULE_CONTAINER_PATH}:ro",
+                "-v",
+                f"{image_sync_dir}:{IMAGE_SYNC_DIR_CONTAINER_PATH}",
+                "--entrypoint",
+                "python3",
+            ]
+        )
+
+    container_cmd.append(args.image)
+    if args.sync_images:
+        container_cmd.extend(
+            [
+                IMAGE_SYNC_HELPER_CONTAINER_PATH,
+                "--codexbox-internal-sync-session",
+                IMAGE_SYNC_DIR_CONTAINER_PATH,
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-C",
+                str(paths.cwd),
+            ]
+        )
+    else:
+        container_cmd.extend(
+            [
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-C",
+                str(paths.cwd),
+            ]
+        )
+    for root in context.existing_roots:
+        if root == str(paths.cwd):
+            continue
+        container_cmd.extend(["--add-dir", root])
+    container_cmd.extend(args.codex_args)
+    return container_cmd
+
+
+def run_launcher_session(
+    args: ParsedArgs,
+    paths: LauncherPaths,
+    context: LauncherContext,
+    mount_specs: list[tuple[str, str]],
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="codexbox-") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        path_profile = temp_dir / "codex-forwarded-path.sh"
+        podman_storage_conf = temp_dir / "codexbox-storage.conf"
+        image_sync_dir = temp_dir / "image-sync"
+        if args.sync_images:
+            image_sync_dir.mkdir()
+        write_path_profile(path_profile, context.current_path)
+        write_podman_storage_conf(
+            podman_storage_conf,
+            context.use_fuse_overlayfs,
+            [context.podman_additional_image_store]
+            if context.podman_additional_image_store
+            else [],
+        )
+        container_cmd = build_container_command(
+            args,
+            paths,
+            context,
+            mount_specs,
+            path_profile,
+            podman_storage_conf,
+            image_sync_dir,
+        )
+
+        if args.print_command or args.dry_run:
+            print(shlex.join(container_cmd))
+
+        if args.dry_run:
+            return
+
+        container_exit_code = run_command(container_cmd, env=context.runtime_env)
+        sync_exit_code = 0
+        if args.sync_images:
+            try:
+                synced_count = import_image_sync_actions(image_sync_dir, context.runtime_env)
+                if synced_count:
+                    print(
+                        f"Synced {synced_count} nested Podman image change(s) to the host store.",
+                        file=sys.stderr,
+                    )
+            except RuntimeError as exc:
+                print(f"Host image sync failed: {exc}", file=sys.stderr)
+                sync_exit_code = 1
+
+        if container_exit_code != 0:
+            raise SystemExit(container_exit_code)
+        if sync_exit_code != 0:
+            raise SystemExit(sync_exit_code)
 
 
 def path_tokens(value: str) -> list[str]:
@@ -603,7 +956,7 @@ def host_podman_store(podman_info: dict[str, object]) -> HostPodmanStore | None:
     if isinstance(graph_options, dict):
         try:
             option_map = require_string_key_dict(
-                graph_options,
+                cast(object, graph_options),
                 "Podman graph options",
             )
         except ValueError:
@@ -793,201 +1146,16 @@ def confirm_env_mount_candidates(
 
 
 def main() -> None:
+    if sys.argv[1:2] == ["--codexbox-internal-sync-session"]:
+        internal_sync_session_main(sys.argv[2:])
+        return
+
     args = parse_args()
-    script_dir = Path(__file__).resolve().parent
-    home_dir = Path.home()
-    codex_dir = home_dir / ".codex"
-    config_path = codex_dir / "config.toml"
-    approvals_path = home_dir / APPROVALS_CONFIG_FILE
-    ignore_path = script_dir / "vars-to-ignore.txt"
-    cwd = shell_pwd()
-
-    if not config_path.is_file():
-        raise SystemExit(f"Missing Codex config: {config_path}")
-    if not cwd.is_dir():
-        raise SystemExit(f"Current directory does not exist: {cwd}")
-    if not codex_dir.is_dir():
-        raise SystemExit(f"Missing Codex directory: {codex_dir}")
-
-    runtime_env = podman_runtime_env()
-    podman_info = load_podman_info(runtime_env)
-    ensure_rootless_podman(podman_info)
-
-    if not args.dry_run:
-        ensure_image(
-            script_dir,
-            args.image,
-            args.rebuild,
-            args.skip_build,
-            runtime_env,
-        )
-    use_fuse_overlayfs = host_fuse_device_available() and image_has_fuse_overlayfs(
-        args.image,
-        runtime_env,
-    )
-
-    shell_env = filtered_shell_env(ignore_path)
-    writable_roots = parse_writable_roots(config_path)
-    existing_roots: list[str] = []
-    for root in writable_roots:
-        path = Path(os.path.expanduser(root))
-        if path.is_dir():
-            existing_roots.append(str(path))
-    existing_roots = ordered_unique(existing_roots)
-
-    current_path = shell_env.get("PATH", os.environ.get("PATH", BASE_PATH))
-    container_path = image_env(args.image, runtime_env).get("PATH", BASE_PATH)
-    forwarded_path = merge_path_values(current_path, container_path)
-    directory_env_map = dict(shell_env)
-    directory_env_map["PATH"] = current_path
-    env_candidates = env_mount_candidates(directory_env_map)
-    ca_env, ca_mount_paths = host_ca_setup()
-    podman_mount_paths = host_podman_mount_paths(home_dir)
-    podman_additional_image_store = host_podman_additional_image_store(
-        podman_info,
-        home_dir,
-        use_fuse_overlayfs,
-    )
-    gitconfig_mount_paths = host_gitconfig_mount_paths(home_dir)
-    github_cli_mount_paths = host_github_cli_mount_paths(home_dir)
-    gitlab_cli_mount_paths = host_gitlab_cli_mount_paths(home_dir)
-    forwarded_env = dict(shell_env)
-    forwarded_env.update(ca_env)
-    forwarded_env["HOME"] = str(home_dir)
-    forwarded_env["PWD"] = str(cwd)
-    forwarded_env["PATH"] = forwarded_path
-    forwarded_env["BASH_ENV"] = PROFILE_SCRIPT_CONTAINER_PATH
-    # The container runs as root. Keep USER/LOGNAME aligned with the actual
-    # in-container identity so nested rootless Podman resolves subuid/subgid
-    # entries for root instead of a forwarded host username.
-    forwarded_env["USER"] = "root"
-    forwarded_env["LOGNAME"] = "root"
-    # Nested rootless Podman cannot reliably mount proc through the OCI
-    # runtime in this container, so prefer chroot isolation for build steps
-    # unless the caller explicitly chose another mode.
-    forwarded_env.setdefault("BUILDAH_ISOLATION", "chroot")
-    base_mount_specs = merge_mount_specs(
-        [
-            (str(cwd), "rw"),
-            (str(codex_dir), "rw"),
-            *((path, "rw") for path in existing_roots),
-            *((path, "rw") for path in podman_mount_paths),
-            *(
-                [(podman_additional_image_store, "ro")]
-                if podman_additional_image_store
-                else []
-            ),
-            *((path, "ro") for path in gitconfig_mount_paths),
-            *((path, "ro") for path in github_cli_mount_paths),
-            *((path, "ro") for path in gitlab_cli_mount_paths),
-            *((path, "ro") for path in ca_mount_paths),
-        ]
-    )
-    saved_approvals = load_env_mount_approvals(approvals_path)
-    home_resolved = str(home_dir.resolve())
-    current_approved_specs = merge_mount_specs(
-        [
-            *base_mount_specs,
-            *(
-                (candidate.path, "ro")
-                for candidate in env_candidates
-                if candidate.path in saved_approvals and candidate.resolved_path != home_resolved
-            ),
-        ]
-    )
-    blocked_home_candidates: list[EnvMountCandidate] = []
-    pending_candidates: list[EnvMountCandidate] = []
-    approved_env_paths: list[str] = []
-
-    for candidate in env_candidates:
-        if is_covered_by_mounts(candidate.path, base_mount_specs):
-            continue
-        if candidate.resolved_path == home_resolved:
-            blocked_home_candidates.append(candidate)
-            continue
-        if is_covered_by_mounts(candidate.path, current_approved_specs):
-            if candidate.path in saved_approvals:
-                approved_env_paths.append(candidate.path)
-            continue
-        pending_candidates.append(candidate)
-
-    if blocked_home_candidates:
-        print(
-            "Skipping env-var-derived mounts of the home directory root:",
-            file=sys.stderr,
-        )
-        for candidate in blocked_home_candidates:
-            env_vars = ", ".join(candidate.env_vars)
-            print(f"  - {candidate.path} (from {env_vars})", file=sys.stderr)
-
-    newly_approved_paths = confirm_env_mount_candidates(approvals_path, pending_candidates)
-    mount_specs = merge_mount_specs(
-        [
-            *base_mount_specs,
-            *((path, "ro") for path in approved_env_paths),
-            *((path, "ro") for path in sorted(newly_approved_paths)),
-        ]
-    )
-    with tempfile.TemporaryDirectory(prefix="codexbox-") as temp_dir:
-        path_profile = Path(temp_dir) / "codex-forwarded-path.sh"
-        podman_storage_conf = Path(temp_dir) / "codexbox-storage.conf"
-        write_path_profile(path_profile, current_path)
-        write_podman_storage_conf(
-            podman_storage_conf,
-            use_fuse_overlayfs,
-            [podman_additional_image_store] if podman_additional_image_store else [],
-        )
-        forwarded_env["CONTAINERS_STORAGE_CONF"] = PODMAN_STORAGE_CONF_CONTAINER_PATH
-
-        container_cmd: list[str] = [
-            CONTAINER_RUNTIME,
-            "run",
-            "--rm",
-            "--init",
-            "--network",
-            "host",
-            *container_tty_flags(),
-            *container_env_flags(forwarded_env),
-            "--workdir",
-            str(cwd),
-        ]
-        if use_fuse_overlayfs:
-            container_cmd.extend(["--device", FUSE_DEVICE_PATH])
-        for path, mode in mount_specs:
-            mount_spec = f"{path}:{path}"
-            if mode == "ro":
-                mount_spec = f"{mount_spec}:ro"
-            container_cmd.extend(["-v", mount_spec])
-        container_cmd.extend(
-            [
-                "-v",
-                f"{path_profile}:{PROFILE_SCRIPT_CONTAINER_PATH}:ro",
-                "-v",
-                f"{podman_storage_conf}:{PODMAN_STORAGE_CONF_CONTAINER_PATH}:ro",
-            ]
-        )
-
-        container_cmd.append(args.image)
-        container_cmd.extend(
-            [
-                "--dangerously-bypass-approvals-and-sandbox",
-                "-C",
-                str(cwd),
-            ]
-        )
-        for root in ordered_unique(existing_roots):
-            if root == str(cwd):
-                continue
-            container_cmd.extend(["--add-dir", root])
-        container_cmd.extend(args.codex_args)
-
-        if args.print_command or args.dry_run:
-            print(shlex.join(container_cmd))
-
-        if args.dry_run:
-            return
-
-        run_checked(container_cmd, env=runtime_env)
+    paths = build_launcher_paths(Path(__file__))
+    validate_launcher_paths(paths)
+    context = prepare_launcher_context(args, paths)
+    mount_specs = resolve_mount_specs(paths, context)
+    run_launcher_session(args, paths, context, mount_specs)
 
 
 def handle_keyboard_interrupt() -> None:
