@@ -16,6 +16,7 @@
 - Maps `~/.config/gh` into the container read-only when it exists on the host.
 - Maps `~/.config/glab-cli` into the container read-only when it exists on the host.
 - Maps `~/.cache/containers`, `~/.local/share/containers`, and `~/.config/containers` into the container when those directories exist on the host.
+- Reuses the host rootless Podman image store as a read-only additional image store for nested Podman when the host store uses `overlay` and nested `fuse-overlayfs` is available.
 - Maps each existing path listed in `sandbox_workspace_write.writable_roots` from `~/.codex/config.toml`.
 - Forwards the invoking shell environment into the container, excluding keys matched by `vars-to-ignore.txt`.
 - Forwards the invoking shell's current `PATH` and prepends it to the image `PATH`.
@@ -27,7 +28,7 @@
 - Requires rootless Podman on the host.
 - Runs as `root` inside the container while bind-mounted files are still written as the invoking host user.
 - Normalizes `USER` and `LOGNAME` to `root` inside the container so nested rootless Podman resolves `/etc/subuid` and `/etc/subgid` for the actual in-container user instead of a forwarded host username.
-- Uses a generated nested Podman `storage.conf` that prefers `overlay` with `fuse-overlayfs` when `/dev/fuse` and the binary are available, and otherwise falls back to `vfs` to avoid overlay-on-overlay startup failures from host Podman storage settings.
+- Uses a generated nested Podman `storage.conf` that prefers `overlay` with `fuse-overlayfs` when `/dev/fuse` and the binary are available, otherwise falls back to `vfs`, and adds the host Podman image store as a read-only `additionalimagestores` entry when it is compatible.
 - Exports `BUILDAH_ISOLATION=chroot` by default inside the container so nested `podman build` `RUN` steps work without extra outer-container privileges. If you already set `BUILDAH_ISOLATION` in your shell, that value is preserved.
 - Starts `codex --dangerously-bypass-approvals-and-sandbox` automatically.
 

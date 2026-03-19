@@ -52,6 +52,12 @@ class EnvMountCandidateDraft:
     env_vars: list[str]
 
 
+@dataclass(frozen=True)
+class HostPodmanStore:
+    graph_driver_name: str
+    graph_root: str
+
+
 @dataclass
 class ParsedArgs(argparse.Namespace):
     image: str = DEFAULT_IMAGE
@@ -109,7 +115,7 @@ def require_string_list(value: object, context: str) -> list[str]:
     if not isinstance(value, list):
         raise ValueError(f"Expected {context} to be a list of strings")
 
-    raw_items = cast(list[object], value)
+    raw_items = value
     items: list[str] = []
     for item in raw_items:
         if not isinstance(item, str):
@@ -118,11 +124,23 @@ def require_string_list(value: object, context: str) -> list[str]:
     return items
 
 
+def require_string(value: object, context: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"Expected {context} to be a string")
+    return value
+
+
+def require_bool(value: object, context: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"Expected {context} to be a boolean")
+    return value
+
+
 def require_string_key_dict(value: object, context: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError(f"Expected {context} to be a JSON object")
 
-    raw_items = cast(dict[object, object], value)
+    raw_items = value
     result: dict[str, object] = {}
     for key, item in raw_items.items():
         if not isinstance(key, str):
@@ -272,10 +290,10 @@ def podman_runtime_env() -> dict[str, str]:
     return env_map
 
 
-def ensure_rootless_podman(runtime_env: dict[str, str]) -> None:
+def load_podman_info(runtime_env: dict[str, str]) -> dict[str, object]:
     try:
         completed = subprocess.run(
-            [CONTAINER_RUNTIME, "info", "--format", "{{.Host.Security.Rootless}}"],
+            [CONTAINER_RUNTIME, "info", "--format", "{{json .}}"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -289,7 +307,31 @@ def ensure_rootless_podman(runtime_env: dict[str, str]) -> None:
         message = completed.stderr.strip() or f"Unable to query {CONTAINER_RUNTIME} info."
         raise SystemExit(message)
 
-    if completed.stdout.strip().lower() != "true":
+    try:
+        raw_info = cast(object, json.loads(completed.stdout.strip() or "{}"))
+        return require_string_key_dict(raw_info, "Podman info")
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise SystemExit(f"Unable to parse {CONTAINER_RUNTIME} info output.") from exc
+
+
+def ensure_rootless_podman(podman_info: dict[str, object]) -> None:
+    try:
+        host_info = require_string_key_dict(
+            podman_info.get("host"),
+            "Podman host info",
+        )
+        security_info = require_string_key_dict(
+            host_info.get("security"),
+            "Podman host security info",
+        )
+        rootless = require_bool(
+            security_info.get("rootless"),
+            "Podman rootless flag",
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    if not rootless:
         raise SystemExit(
             "This launcher requires rootless Podman so container root maps back "
             "to the invoking host user."
@@ -438,7 +480,11 @@ def write_path_profile(script_path: Path, forwarded_path: str) -> None:
     _ = script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_podman_storage_conf(config_path: Path, use_fuse_overlayfs: bool) -> None:
+def write_podman_storage_conf(
+    config_path: Path,
+    use_fuse_overlayfs: bool,
+    additional_image_stores: Iterable[str] = (),
+) -> None:
     # Nested Podman runs on top of the outer container filesystem. Prefer
     # fuse-overlayfs when the binary and /dev/fuse are available, otherwise
     # fall back to vfs to avoid overlay-on-overlay failures.
@@ -449,6 +495,18 @@ def write_podman_storage_conf(config_path: Path, use_fuse_overlayfs: bool) -> No
         'graphroot = "/var/lib/containers/storage"',
         'runroot = "/run/containers/storage"',
     ]
+    ordered_image_stores = ordered_unique(additional_image_stores)
+    if ordered_image_stores:
+        additional_store_list = ", ".join(
+            json.dumps(path) for path in ordered_image_stores
+        )
+        lines.extend(
+            [
+                "",
+                "[storage.options]",
+                f"additionalimagestores = [{additional_store_list}]",
+            ]
+        )
     if use_fuse_overlayfs:
         lines.extend(
             [
@@ -517,6 +575,60 @@ def host_ca_setup() -> tuple[dict[str, str], list[str]]:
         env_updates["SSL_CERT_FILE"] = cert_file
 
     return env_updates, ordered_unique(mount_paths)
+
+
+def host_podman_store(podman_info: dict[str, object]) -> HostPodmanStore | None:
+    try:
+        store = require_string_key_dict(
+            podman_info.get("store"),
+            "Podman store info",
+        )
+        graph_driver_name = require_string(
+            store.get("graphDriverName"),
+            "Podman graph driver name",
+        ).strip()
+        graph_root = require_string(
+            store.get("graphRoot"),
+            "Podman graph root",
+        ).strip()
+    except ValueError:
+        return None
+
+    if not graph_driver_name or not graph_root:
+        return None
+
+    return HostPodmanStore(
+        graph_driver_name=graph_driver_name,
+        graph_root=graph_root,
+    )
+
+
+def host_podman_additional_image_store(
+    podman_info: dict[str, object],
+    home_dir: Path,
+    use_fuse_overlayfs: bool,
+) -> str | None:
+    # Reuse only the host image store, not the writable graphroot, so nested
+    # Podman can see already-pulled layers without sharing the live writable
+    # state between the host and the inner container.
+    if not use_fuse_overlayfs:
+        return None
+
+    store = host_podman_store(podman_info)
+    if store is None or store.graph_driver_name != "overlay":
+        return None
+
+    graph_root = Path(store.graph_root).expanduser()
+    if not graph_root.is_absolute() or not graph_root.is_dir():
+        return None
+
+    try:
+        if graph_root.resolve() == home_dir.resolve():
+            return None
+    except OSError:
+        return None
+
+    return str(graph_root)
 
 
 def host_podman_mount_paths(home_dir: Path) -> list[str]:
@@ -677,7 +789,8 @@ def main() -> None:
         raise SystemExit(f"Missing Codex directory: {codex_dir}")
 
     runtime_env = podman_runtime_env()
-    ensure_rootless_podman(runtime_env)
+    podman_info = load_podman_info(runtime_env)
+    ensure_rootless_podman(podman_info)
 
     if not args.dry_run:
         ensure_image(
@@ -709,6 +822,11 @@ def main() -> None:
     env_candidates = env_mount_candidates(directory_env_map)
     ca_env, ca_mount_paths = host_ca_setup()
     podman_mount_paths = host_podman_mount_paths(home_dir)
+    podman_additional_image_store = host_podman_additional_image_store(
+        podman_info,
+        home_dir,
+        use_fuse_overlayfs,
+    )
     gitconfig_mount_paths = host_gitconfig_mount_paths(home_dir)
     github_cli_mount_paths = host_github_cli_mount_paths(home_dir)
     gitlab_cli_mount_paths = host_gitlab_cli_mount_paths(home_dir)
@@ -733,6 +851,11 @@ def main() -> None:
             (str(codex_dir), "rw"),
             *((path, "rw") for path in existing_roots),
             *((path, "rw") for path in podman_mount_paths),
+            *(
+                [(podman_additional_image_store, "ro")]
+                if podman_additional_image_store
+                else []
+            ),
             *((path, "ro") for path in gitconfig_mount_paths),
             *((path, "ro") for path in github_cli_mount_paths),
             *((path, "ro") for path in gitlab_cli_mount_paths),
@@ -788,7 +911,11 @@ def main() -> None:
         path_profile = Path(temp_dir) / "codex-forwarded-path.sh"
         podman_storage_conf = Path(temp_dir) / "codexbox-storage.conf"
         write_path_profile(path_profile, current_path)
-        write_podman_storage_conf(podman_storage_conf, use_fuse_overlayfs)
+        write_podman_storage_conf(
+            podman_storage_conf,
+            use_fuse_overlayfs,
+            [podman_additional_image_store] if podman_additional_image_store else [],
+        )
         forwarded_env["CONTAINERS_STORAGE_CONF"] = PODMAN_STORAGE_CONF_CONTAINER_PATH
 
         container_cmd: list[str] = [
