@@ -30,7 +30,7 @@ host mounts, environment variables, certificates, and nested container tooling.
 cargo build
 ```
 
-Install a release build to `~/.local/bin`:
+Install a release build to `${CARGO_HOME:-~/.cargo}/bin`:
 
 ```bash
 ./install.sh
@@ -39,7 +39,7 @@ Install a release build to `~/.local/bin`:
 Equivalent Cargo command:
 
 ```bash
-cargo install --path . --locked --force --root ~/.local
+cargo install --path . --locked --force --root "${CARGO_HOME:-$HOME/.cargo}"
 ```
 
 ## Run
