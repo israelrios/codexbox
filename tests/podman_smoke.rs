@@ -83,7 +83,7 @@ fn launches_real_podman_sandbox_when_enabled() {
         .arg("--container-command")
         .arg("/bin/sh")
         .arg("-lc")
-        .arg("test -S \"$XDG_RUNTIME_DIR/podman/podman.sock\" && test -S /var/run/docker.sock && printf smoke")
+        .arg("test -S \"$XDG_RUNTIME_DIR/podman/podman.sock\" && test -S /var/run/docker.sock && command -v openssl >/dev/null && printf smoke")
         .current_dir(&workspace);
 
     let output = command.output().unwrap();
