@@ -20,6 +20,7 @@ pub enum MountMode {
 pub enum MountSource {
     Fixed,
     CodexWritableRoot,
+    CodexAddDir,
     EnvDerived { var_name: String },
     CaTrust,
     Podman,
