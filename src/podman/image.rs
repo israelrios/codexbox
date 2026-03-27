@@ -108,10 +108,6 @@ fn build_image(image: &str, fingerprint: &str) -> Result<()> {
 }
 
 fn image_is_fresh(image: &str, fingerprint: &str) -> Result<bool> {
-    if !image_exists(image)? {
-        return Ok(false);
-    }
-
     let output = Command::new("podman")
         .arg("image")
         .arg("inspect")
@@ -127,17 +123,6 @@ fn image_is_fresh(image: &str, fingerprint: &str) -> Result<bool> {
 
     Ok(parse_image_metadata(&output.stdout)
         .is_some_and(|metadata| metadata.fingerprint == fingerprint && !metadata.is_expired()))
-}
-
-fn image_exists(image: &str) -> Result<bool> {
-    let status = Command::new("podman")
-        .arg("image")
-        .arg("exists")
-        .arg(image)
-        .status()
-        .map_err(CodexboxError::PodmanSpawn)?;
-
-    Ok(status.success())
 }
 
 fn image_metadata_format() -> String {

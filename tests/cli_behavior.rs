@@ -273,8 +273,8 @@ fn fresh_image_skips_rebuild() {
     let log = fs::read_to_string(&podman_log).unwrap();
 
     assert!(output.status.success());
-    assert!(log.contains("ARGS:[image][exists][localhost/codexbox:latest]"));
     assert!(log.contains("ARGS:[image][inspect]"));
+    assert!(!log.contains("ARGS:[image][exists][localhost/codexbox:latest]"));
     assert!(!log.contains("ARGS:[build]"));
 }
 
@@ -351,7 +351,8 @@ fn run_uses_argv_container_command_without_shell_env_channel() {
     let log = fs::read_to_string(&podman_log).unwrap();
 
     assert!(output.status.success());
-    assert!(log.contains("ARGS:[image][exists][localhost/codexbox:latest]"));
+    assert!(log.contains("ARGS:[image][inspect]"));
+    assert!(!log.contains("ARGS:[image][exists][localhost/codexbox:latest]"));
     assert!(log.contains("ARGS:[run]"));
     assert!(log.contains("[localhost/codexbox:latest][podman][info]"));
     assert!(!log.contains("CODEXBOX_CONTAINER_COMMAND"));
