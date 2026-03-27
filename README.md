@@ -108,8 +108,9 @@ cargo run -- --container-command podman info
 - The launcher rebuilds the Podman image automatically when the embedded container assets change, when the image is
   older than 7 days, or when the image is missing.
 - Image rebuilds intentionally install the latest `@openai/codex` npm package.
-- When Podman inside codexbox builds or downloads images, `codexbox` exports those images at the end of the run and
-  loads them into the host Podman image store automatically.
+- When Podman inside codexbox builds or downloads images, `codexbox` exports writable local images from the sandbox at
+  the end of the run and loads them into the host Podman image store automatically. Images only visible through the
+  host's read-only additional image store are ignored.
 
 ## Test
 

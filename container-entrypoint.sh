@@ -33,12 +33,17 @@ before_images_file=
 after_images_file=
 diff_images_file=
 
+list_syncable_images() {
+    # Ignore images exposed through the read-only additional image store.
+    podman images --filter readonly=false --format '{{.Repository}}|{{.Tag}}|{{.ID}}' | sort -u
+}
+
 if [ "${CODEXBOX_IMAGE_EXPORT_DIR:-}" != "" ]; then
     mkdir -p "$CODEXBOX_IMAGE_EXPORT_DIR"
     before_images_file=$(mktemp)
     after_images_file=$(mktemp)
     diff_images_file=$(mktemp)
-    podman images --format '{{.Repository}}|{{.Tag}}|{{.ID}}' | sort -u > "$before_images_file"
+    list_syncable_images > "$before_images_file"
 fi
 
 mkdir -p "$XDG_RUNTIME_DIR/podman"
@@ -75,7 +80,7 @@ command_status=$?
 set -e
 
 if [ "$after_images_file" != "" ]; then
-    podman images --format '{{.Repository}}|{{.Tag}}|{{.ID}}' | sort -u > "$after_images_file"
+    list_syncable_images > "$after_images_file"
     comm -13 "$before_images_file" "$after_images_file" > "$diff_images_file"
 
     image_index=0

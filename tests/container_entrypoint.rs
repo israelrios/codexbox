@@ -143,6 +143,106 @@ exit 0
 }
 
 #[test]
+fn entrypoint_ignores_images_from_readonly_host_store_during_export() {
+    let dir = tempdir().unwrap();
+    let fake_bin = dir.path().join("fake-bin");
+    let home_dir = dir.path().join("home");
+    let runtime_dir = dir.path().join("runtime");
+    let export_dir = dir.path().join("exports");
+    let podman_log = dir.path().join("podman.log");
+    let images_count = dir.path().join("images.count");
+    let socket_dir = runtime_dir.join("podman");
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+    fs::create_dir_all(&socket_dir).unwrap();
+    let _socket = UnixListener::bind(socket_dir.join("podman.sock")).unwrap();
+
+    write_fake_podman(
+        &fake_bin.join("podman"),
+        r#"#!/bin/sh
+log_file="${CODEXBOX_TEST_PODMAN_LOG:?}"
+count_file="${CODEXBOX_TEST_PODMAN_IMAGES_COUNT:?}"
+
+if [ "$1" = "system" ] && [ "$2" = "service" ]; then
+    exit 0
+fi
+
+if [ "$1" = "images" ]; then
+    has_readonly_filter=false
+    prev=
+    for arg in "$@"; do
+        if [ "$prev" = "--filter" ] && [ "$arg" = "readonly=false" ]; then
+            has_readonly_filter=true
+        fi
+        prev="$arg"
+    done
+
+    count=0
+    if [ -f "$count_file" ]; then
+        count=$(cat "$count_file")
+    fi
+    count=$((count + 1))
+    printf '%s' "$count" > "$count_file"
+
+    if [ "$count" -eq 1 ]; then
+        printf 'base|latest|sha256:base\n'
+    elif [ "$has_readonly_filter" = true ]; then
+        printf 'base|latest|sha256:base\napp|latest|sha256:new\n'
+    else
+        printf 'base|latest|sha256:base\napp|latest|sha256:new\nhost|latest|sha256:host\n'
+    fi
+    exit 0
+fi
+
+if [ "$1" = "save" ]; then
+    output_path=
+    image_ref=
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --output)
+                shift
+                output_path="$1"
+                ;;
+            *)
+                image_ref="$1"
+                ;;
+        esac
+        shift
+    done
+    : > "$output_path"
+    printf 'SAVE:%s\n' "$image_ref" >> "$log_file"
+    exit 0
+fi
+
+exit 0
+"#,
+    );
+
+    let output = Command::new("/bin/sh")
+        .arg(entrypoint_path())
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("true")
+        .env_clear()
+        .env("HOME", &home_dir)
+        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("CODEXBOX_IMAGE_EXPORT_DIR", &export_dir)
+        .env("CODEXBOX_TEST_PODMAN_LOG", &podman_log)
+        .env("CODEXBOX_TEST_PODMAN_IMAGES_COUNT", &images_count)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(export_dir.join("image-0.tar").is_file());
+    assert!(!export_dir.join("image-1.tar").exists());
+
+    let log = fs::read_to_string(&podman_log).unwrap();
+    assert!(log.contains("SAVE:app:latest"));
+    assert!(!log.contains("SAVE:host:latest"));
+}
+
+#[test]
 fn entrypoint_links_root_bash_init_files_when_missing() {
     let dir = tempdir().unwrap();
     let fake_bin = dir.path().join("fake-bin");
