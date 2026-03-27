@@ -1,10 +1,12 @@
 use std::ffi::OsString;
+use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::{RuntimeAssets, UserContext};
+use tempfile::TempDir;
+
+use crate::config::UserContext;
 use crate::env_filter::ForwardedEnv;
 use crate::errors::{CodexboxError, Result};
 use crate::mounts::{MountMode, MountSpec};
@@ -13,6 +15,10 @@ pub const DEFAULT_IMAGE: &str = "localhost/codexbox:latest";
 const PATH_PREFIX_ENV: &str = "CODEXBOX_PATH_PREFIX";
 const IMAGE_EXPORT_DIR_ENV: &str = "CODEXBOX_IMAGE_EXPORT_DIR";
 const CONTAINER_COMMAND_ENV: &str = "CODEXBOX_CONTAINER_COMMAND";
+const CONTAINERFILE: &str = include_str!("../Containerfile");
+const CONTAINERS_CONF: &[u8] = include_bytes!("../containers.conf");
+const PODMAN_CONTAINERS_CONF: &[u8] = include_bytes!("../podman-containers.conf");
+const CONTAINER_ENTRYPOINT: &[u8] = include_bytes!("../container-entrypoint.sh");
 
 #[derive(Debug, Clone)]
 pub enum ContainerCommand {
@@ -32,18 +38,71 @@ pub struct PodmanPlan {
     pub workdir: std::path::PathBuf,
 }
 
-pub fn ensure_image(assets: &RuntimeAssets, image: &str, rebuild: bool) -> Result<()> {
+struct EmbeddedBuildContext {
+    tempdir: TempDir,
+}
+
+impl EmbeddedBuildContext {
+    fn create() -> Result<Self> {
+        let temp_root = std::env::temp_dir();
+        let tempdir = tempfile::Builder::new()
+            .prefix("codexbox-build-")
+            .tempdir_in(&temp_root)
+            .map_err(|source| CodexboxError::WritePath {
+                path: temp_root,
+                source,
+            })?;
+
+        write_embedded_asset(
+            tempdir.path().join("Containerfile"),
+            CONTAINERFILE.as_bytes(),
+        )?;
+        write_embedded_asset(tempdir.path().join("containers.conf"), CONTAINERS_CONF)?;
+        write_embedded_asset(
+            tempdir.path().join("podman-containers.conf"),
+            PODMAN_CONTAINERS_CONF,
+        )?;
+        write_embedded_asset(
+            tempdir.path().join("container-entrypoint.sh"),
+            CONTAINER_ENTRYPOINT,
+        )?;
+
+        Ok(Self { tempdir })
+    }
+
+    fn path(&self) -> &Path {
+        self.tempdir.path()
+    }
+
+    fn containerfile_path(&self) -> PathBuf {
+        self.tempdir.path().join("Containerfile")
+    }
+}
+
+pub struct ImageExportDir {
+    tempdir: TempDir,
+}
+
+impl ImageExportDir {
+    pub fn path(&self) -> &Path {
+        self.tempdir.path()
+    }
+}
+
+pub fn ensure_image(image: &str, rebuild: bool) -> Result<()> {
     if !rebuild && image_exists(image)? {
         return Ok(());
     }
+
+    let context = EmbeddedBuildContext::create()?;
 
     let status = Command::new("podman")
         .arg("build")
         .arg("--tag")
         .arg(image)
         .arg("--file")
-        .arg(&assets.containerfile_path)
-        .arg(&assets.project_root)
+        .arg(context.containerfile_path())
+        .arg(context.path())
         .status()
         .map_err(CodexboxError::PodmanSpawn)?;
 
@@ -60,6 +119,10 @@ pub fn run_plan(plan: &PodmanPlan, user: &UserContext) -> Result<i32> {
     let mut command = build_command(plan, user);
     let status = command.status().map_err(CodexboxError::PodmanSpawn)?;
     Ok(status.code().unwrap_or(1))
+}
+
+fn write_embedded_asset(path: PathBuf, contents: &[u8]) -> Result<()> {
+    fs::write(&path, contents).map_err(|source| CodexboxError::WritePath { path, source })
 }
 
 pub fn render_plan(plan: &PodmanPlan, user: &UserContext) -> String {
@@ -100,7 +163,7 @@ fn build_command(plan: &PodmanPlan, user: &UserContext) -> Command {
     }
 
     for mount in &plan.mounts {
-        command.arg("--volume").arg(format_mount(mount));
+        command.arg("--mount").arg(format_mount(mount));
     }
 
     command
@@ -157,7 +220,7 @@ fn image_exists(image: &str) -> Result<bool> {
     Ok(status.success())
 }
 
-pub fn create_image_export_dir(user: &UserContext) -> Result<PathBuf> {
+pub fn create_image_export_dir(user: &UserContext) -> Result<ImageExportDir> {
     let root = user
         .home_dir
         .join(".local")
@@ -169,16 +232,13 @@ pub fn create_image_export_dir(user: &UserContext) -> Result<PathBuf> {
         source,
     })?;
 
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or(0);
-    let path = root.join(format!("run-{}-{stamp}", std::process::id()));
-    std::fs::create_dir_all(&path).map_err(|source| CodexboxError::WritePath {
-        path: path.clone(),
-        source,
-    })?;
-    Ok(path)
+    let prefix = format!("run-{}-", std::process::id());
+    let tempdir = tempfile::Builder::new()
+        .prefix(&prefix)
+        .tempdir_in(&root)
+        .map_err(|source| CodexboxError::WritePath { path: root, source })?;
+
+    Ok(ImageExportDir { tempdir })
 }
 
 pub fn dry_run_image_export_dir(user: &UserContext) -> PathBuf {
@@ -233,30 +293,24 @@ pub fn import_exported_images(export_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn remove_image_export_dir(export_dir: &Path) -> Result<()> {
-    if export_dir.exists() {
-        std::fs::remove_dir_all(export_dir).map_err(|source| CodexboxError::WritePath {
-            path: export_dir.to_path_buf(),
-            source,
-        })?;
+fn format_mount(mount: &MountSpec) -> String {
+    let mut parts = vec![
+        "type=bind".to_string(),
+        format!("src={}", escape_mount_value(&mount.host)),
+        format!("target={}", escape_mount_value(&mount.guest)),
+    ];
+
+    if mount.mode == MountMode::ReadOnly {
+        parts.push("ro".to_string());
     }
 
-    Ok(())
+    parts.join(",")
 }
 
-fn format_mount(mount: &MountSpec) -> String {
-    let mode = match mount.mode {
-        MountMode::ReadOnly => "ro",
-        MountMode::ReadWrite => "rw",
-        MountMode::Tmpfs => "rw",
-    };
-
-    format!(
-        "{}:{}:{}",
-        mount.host.display(),
-        mount.guest.display(),
-        mode
-    )
+fn escape_mount_value(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace(',', "\\,")
 }
 
 fn status_to_string(code: Option<i32>) -> String {
@@ -288,7 +342,7 @@ mod tests {
     use super::{format_mount, render_plan, ContainerCommand, PodmanPlan};
 
     #[test]
-    fn format_mount_uses_expected_suffix() {
+    fn format_mount_uses_bind_syntax() {
         let mount = MountSpec {
             host: PathBuf::from("/host"),
             guest: PathBuf::from("/guest"),
@@ -296,7 +350,22 @@ mod tests {
             source: MountSource::Fixed,
         };
 
-        assert_eq!(format_mount(&mount), "/host:/guest:ro");
+        assert_eq!(format_mount(&mount), "type=bind,src=/host,target=/guest,ro");
+    }
+
+    #[test]
+    fn format_mount_preserves_colons_in_paths() {
+        let mount = MountSpec {
+            host: PathBuf::from("/host:with:colon"),
+            guest: PathBuf::from("/guest:with:colon"),
+            mode: MountMode::ReadWrite,
+            source: MountSource::Fixed,
+        };
+
+        assert_eq!(
+            format_mount(&mount),
+            "type=bind,src=/host:with:colon,target=/guest:with:colon"
+        );
     }
 
     #[test]
@@ -334,7 +403,7 @@ mod tests {
         assert!(rendered.contains("podman run --rm -i"));
         assert!(rendered.contains("--workdir '/work tree'"));
         assert!(rendered.contains("--publish 127.0.0.1:8080:80"));
-        assert!(rendered.contains("--volume '/host path:/guest path:rw'"));
+        assert!(rendered.contains("--mount 'type=bind,src=/host path,target=/guest path'"));
         assert!(rendered.contains("--env CODEXBOX_PATH_PREFIX=/opt/bin:/custom/bin"));
         assert!(
             rendered.contains("--env CODEXBOX_IMAGE_EXPORT_DIR=/var/lib/codexbox-image-exports")

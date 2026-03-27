@@ -81,6 +81,7 @@ cargo run -- --container-command 'podman info'
 
 ```bash
 cargo test
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 ## Project layout

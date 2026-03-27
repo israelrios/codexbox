@@ -6,6 +6,8 @@ use serde::Deserialize;
 
 use crate::errors::{CodexboxError, Result};
 
+const VARS_TO_IGNORE: &str = include_str!("../vars-to-ignore.txt");
+
 #[derive(Debug, Clone)]
 pub struct LauncherConfig {
     pub ignore_var_patterns: Vec<String>,
@@ -18,13 +20,6 @@ pub struct WorkspaceCodexboxConfig {
     pub publish: Vec<String>,
     #[serde(default)]
     pub add_dirs: Vec<PathBuf>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RuntimeAssets {
-    pub project_root: PathBuf,
-    pub vars_to_ignore_path: PathBuf,
-    pub containerfile_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -52,49 +47,11 @@ impl UserContext {
     }
 }
 
-impl RuntimeAssets {
-    pub fn detect() -> Result<Self> {
-        let mut roots = Vec::new();
-
-        if let Ok(current_exe) = std::env::current_exe() {
-            if let Some(parent) = current_exe.parent() {
-                roots.push(parent.to_path_buf());
-            }
-        }
-
-        roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-
-        if let Ok(current_dir) = std::env::current_dir() {
-            roots.push(current_dir);
-        }
-
-        for root in roots {
-            let vars_to_ignore_path = root.join("vars-to-ignore.txt");
-            let containerfile_path = root.join("Containerfile");
-
-            if vars_to_ignore_path.exists() && containerfile_path.exists() {
-                return Ok(Self {
-                    project_root: root,
-                    vars_to_ignore_path,
-                    containerfile_path,
-                });
-            }
-        }
-
-        Err(CodexboxError::MissingAsset(
-            "Containerfile or vars-to-ignore.txt",
-        ))
+pub fn load_launcher_config(user: &UserContext) -> LauncherConfig {
+    LauncherConfig {
+        ignore_var_patterns: parse_ignore_patterns(VARS_TO_IGNORE),
+        approval_db_path: user.home_dir.join(".codexbox-conf.json"),
     }
-}
-
-pub fn load_launcher_config(assets: &RuntimeAssets, user: &UserContext) -> Result<LauncherConfig> {
-    let ignore_var_patterns = read_ignore_patterns(&assets.vars_to_ignore_path)?;
-    let approval_db_path = user.home_dir.join(".codexbox-conf.json");
-
-    Ok(LauncherConfig {
-        ignore_var_patterns,
-        approval_db_path,
-    })
 }
 
 pub fn load_workspace_codexbox_config(cwd: &Path) -> Result<WorkspaceCodexboxConfig> {
@@ -111,36 +68,28 @@ pub fn load_workspace_codexbox_config(cwd: &Path) -> Result<WorkspaceCodexboxCon
     serde_json::from_str(&contents).map_err(|source| CodexboxError::ParseJson { path, source })
 }
 
-fn read_ignore_patterns(path: &Path) -> Result<Vec<String>> {
-    let contents = fs::read_to_string(path).map_err(|source| CodexboxError::ReadPath {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    Ok(contents
+fn parse_ignore_patterns(contents: &str) -> Vec<String> {
+    contents
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(ToOwned::to_owned)
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::path::PathBuf;
 
     use tempfile::tempdir;
 
-    use super::{load_workspace_codexbox_config, read_ignore_patterns, WorkspaceCodexboxConfig};
+    use std::fs;
+
+    use super::{load_workspace_codexbox_config, parse_ignore_patterns, WorkspaceCodexboxConfig};
 
     #[test]
     fn read_ignore_patterns_skips_comments_and_blank_lines() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("vars-to-ignore.txt");
-        fs::write(&path, "# comment\n\nFOO\nBAR*\n").unwrap();
-
-        let patterns = read_ignore_patterns(&path).unwrap();
+        let patterns = parse_ignore_patterns("# comment\n\nFOO\nBAR*\n");
 
         assert_eq!(patterns, vec!["FOO", "BAR*"]);
     }

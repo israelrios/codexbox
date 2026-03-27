@@ -74,7 +74,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
+    use std::path::Path;
 
     use tempfile::tempdir;
 
@@ -125,6 +125,6 @@ mod tests {
         assert!(!candidates.iter().any(|item| item.host_path == home));
         assert!(!candidates
             .iter()
-            .any(|item| item.host_path == PathBuf::from("/usr/bin")));
+            .any(|item| item.host_path == Path::new("/usr/bin")));
     }
 }

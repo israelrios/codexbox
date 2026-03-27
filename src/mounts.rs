@@ -4,16 +4,15 @@ use std::path::{Path, PathBuf};
 
 use crate::config::UserContext;
 use crate::env_mounts::EnvMountCandidate;
+use crate::errors::{CodexboxError, Result};
 
 pub const GUEST_PODMAN_ROOT: &str = "/var/lib/containers";
 pub const GUEST_ADDITIONAL_IMAGE_STORE: &str = "/var/lib/shared";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum MountMode {
     ReadOnly,
     ReadWrite,
-    Tmpfs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +33,7 @@ pub struct MountSpec {
     pub source: MountSource,
 }
 
-pub fn base_mounts(user: &UserContext, writable_roots: &[PathBuf]) -> Vec<MountSpec> {
+pub fn base_mounts(user: &UserContext, writable_roots: &[PathBuf]) -> Result<Vec<MountSpec>> {
     let mut mounts = Vec::new();
 
     mounts.push(MountSpec {
@@ -45,7 +44,7 @@ pub fn base_mounts(user: &UserContext, writable_roots: &[PathBuf]) -> Vec<MountS
     });
 
     let codex_dir = user.home_dir.join(".codex");
-    let _ = fs::create_dir_all(&codex_dir);
+    ensure_dir(&codex_dir)?;
     mounts.push(MountSpec {
         host: codex_dir.clone(),
         guest: codex_dir,
@@ -77,8 +76,8 @@ pub fn base_mounts(user: &UserContext, writable_roots: &[PathBuf]) -> Vec<MountS
         });
     }
 
-    mounts.extend(podman_persistence_mounts(user));
-    dedupe_mounts(mounts)
+    mounts.extend(podman_persistence_mounts(user)?);
+    Ok(dedupe_mounts(mounts))
 }
 
 pub fn approved_env_mounts(candidates: &[EnvMountCandidate]) -> Vec<MountSpec> {
@@ -145,14 +144,14 @@ pub fn mount_covers_path(mount: &MountSpec, path: &Path) -> bool {
     }
 }
 
-fn podman_persistence_mounts(user: &UserContext) -> Vec<MountSpec> {
+fn podman_persistence_mounts(user: &UserContext) -> Result<Vec<MountSpec>> {
     let storage_root = user
         .home_dir
         .join(".local")
         .join("share")
         .join("codexbox")
         .join("containers");
-    let _ = fs::create_dir_all(&storage_root);
+    ensure_dir(&storage_root)?;
 
     let mut mounts = vec![MountSpec {
         host: storage_root,
@@ -176,7 +175,14 @@ fn podman_persistence_mounts(user: &UserContext) -> Vec<MountSpec> {
         });
     }
 
-    mounts
+    Ok(mounts)
+}
+
+fn ensure_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).map_err(|source| CodexboxError::WritePath {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn dedupe_mounts(mounts: Vec<MountSpec>) -> Vec<MountSpec> {
@@ -199,7 +205,7 @@ fn dedupe_mounts(mounts: Vec<MountSpec>) -> Vec<MountSpec> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::Path;
 
     use tempfile::tempdir;
 
@@ -228,7 +234,7 @@ mod tests {
             cwd: cwd.clone(),
         };
 
-        let mounts = base_mounts(&user, &[]);
+        let mounts = base_mounts(&user, &[]).unwrap();
         let candidates = vec![EnvMountCandidate {
             var_name: "DIRENV_DIR".into(),
             host_path: nested,
@@ -257,16 +263,16 @@ mod tests {
             cwd,
         };
 
-        let mounts = base_mounts(&user, &[]);
+        let mounts = base_mounts(&user, &[]).unwrap();
 
         assert!(mounts.iter().any(|mount| {
             mount.host == home.join(".local/share/codexbox/containers")
-                && mount.guest == PathBuf::from(GUEST_PODMAN_ROOT)
+                && mount.guest == Path::new(GUEST_PODMAN_ROOT)
                 && mount.mode == MountMode::ReadWrite
         }));
         assert!(mounts.iter().any(|mount| {
             mount.host == home.join(".local/share/containers/storage")
-                && mount.guest == PathBuf::from(GUEST_ADDITIONAL_IMAGE_STORE)
+                && mount.guest == Path::new(GUEST_ADDITIONAL_IMAGE_STORE)
                 && mount.mode == MountMode::ReadOnly
         }));
         assert!(!mounts

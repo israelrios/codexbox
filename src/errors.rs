@@ -47,9 +47,6 @@ pub enum CodexboxError {
     #[error("could not determine the invoking user's home directory")]
     MissingHomeDir,
 
-    #[error("required runtime asset not found: {0}")]
-    MissingAsset(&'static str),
-
     #[error("podman command failed to start: {0}")]
     PodmanSpawn(#[source] std::io::Error),
 
