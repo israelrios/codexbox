@@ -312,6 +312,7 @@ fn stale_image_triggers_rebuild() {
     assert!(output.status.success());
     assert!(log.contains("ARGS:[image][inspect]"));
     assert!(log.contains("ARGS:[build]"));
+    assert!(log.contains("[--isolation][chroot]"));
 }
 
 #[test]

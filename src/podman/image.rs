@@ -86,6 +86,8 @@ fn build_image(image: &str, fingerprint: &str) -> Result<()> {
 
     let status = Command::new("podman")
         .arg("build")
+        .arg("--isolation")
+        .arg("chroot")
         .arg("--tag")
         .arg(image)
         .arg("--label")
