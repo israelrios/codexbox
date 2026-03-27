@@ -67,7 +67,8 @@ Schema:
   "approved_paths": ["/run/user/1000/podman/podman.sock"],
   "publish": ["127.0.0.1:8080:80"],
   "add_dirs": ["~/shared"],
-  "ignore_var_patterns": ["MY_SECRET_*"],
+  "block_var_patterns": ["MY_SECRET_*"],
+  "allow_var_patterns": ["SSH_AUTH_SOCK"],
   "directories": {
     "~/work/project": {
       "publish": ["3000:3000"],
@@ -82,7 +83,8 @@ Rules:
 - `approved_paths` stores globally approved read-only env-derived mounts
 - `publish` adds Podman `--publish` entries
 - `add_dirs` adds extra writable directory mounts and matching `codex --add-dir` arguments
-- `ignore_var_patterns` extends the built-in environment ignore list
+- `block_var_patterns` extends the built-in environment block list
+- `allow_var_patterns` re-allows variables blocked by default or by `block_var_patterns`
 - `directories` provides per-directory overrides for `publish` and `add_dirs` only
 
 Path handling:
@@ -149,9 +151,10 @@ The launcher forwards the invoking environment after filtering.
 
 Rules:
 
-- use an embedded built-in ignore-pattern list
-- extend that list with `ignore_var_patterns` from `~/.codexbox-conf.json`
-- do not forward any variable whose key matches the effective ignore list
+- use an embedded built-in block-pattern list
+- extend that list with `block_var_patterns` from `~/.codexbox-conf.json`
+- allow explicit exceptions through `allow_var_patterns`
+- do not forward any variable whose key matches the effective block list unless it also matches an allow pattern
 - explicitly preserve the invoking `PATH`
 - never forward internal `CODEXBOX_*` control variables
 
@@ -164,7 +167,7 @@ Candidate rules:
 - skip any value containing `://`
 - otherwise split values on `:`
 - keep only absolute paths
-- keep only existing files, directories, or Unix sockets
+- keep only existing files, directories, Unix sockets, or symlinks that resolve to them
 - mount all accepted candidates read-only
 - deduplicate repeated paths
 
@@ -203,7 +206,8 @@ Requirements:
 
 - use rootless Podman
 - keep the runtime image build context embedded in the binary
-- rebuild the sandbox image when it is missing, when its embedded-asset fingerprint is stale, or when `--rebuild-image` is set
+- rebuild the sandbox image when it is missing, when its embedded-asset fingerprint is stale, when the existing image is older than 7 days, or when `--rebuild-image` is set
+- install the latest available `@openai/codex` npm package whenever the sandbox image is rebuilt
 - avoid rebuilding when the current image fingerprint already matches
 - keep Podman-created images available in the user environment outside the sandbox
 
@@ -236,4 +240,4 @@ The implementation is correct only if all of the following hold:
 - env-derived approvals are stored globally in `approved_paths`
 - `--dry-run` is side-effect free
 - env-derived discovery ignores URL-like values containing `://`
-- the sandbox image is rebuilt only when necessary or explicitly requested
+- the sandbox image is rebuilt only when necessary, when older than 7 days, or explicitly requested

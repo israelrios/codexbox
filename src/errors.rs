@@ -58,4 +58,7 @@ pub enum CodexboxError {
 
     #[error("interactive approval prompt failed: {0}")]
     PromptIo(#[source] std::io::Error),
+
+    #[error("{0}")]
+    SystemTime(String),
 }

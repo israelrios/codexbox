@@ -8,7 +8,7 @@
 #
 # https://bodhi.fedoraproject.org/updates/?search=podman
 
-FROM registry.fedoraproject.org/fedora:latest
+FROM registry.fedoraproject.org/fedora:43
 
 # When building for multiple-architectures in parallel using emulation
 # it's really easy for one/more dnf processes to timeout or mis-count
@@ -18,6 +18,7 @@ RUN echo -e "\n\n# Added during image build" >> /etc/dnf/dnf.conf && \
     echo -e "minrate=100\ntimeout=60\n" >> /etc/dnf/dnf.conf
 
 ARG INSTALL_RPMS="podman podman-docker bubblewrap fuse-overlayfs slirp4netns passt openssh-clients cpp git-core sqlite python3 python3-pip python3-pytest nodejs ripgrep jq gcc gcc-c++ make procps-ng gh glab"
+ARG BASEDPYRIGHT_NPM_VERSION="1.38.4"
 
 # Don't include container-selinux and remove
 # directories used by dnf that are just taking
@@ -29,7 +30,7 @@ RUN dnf -y makecache && \
     dnf -y update && \
     rpm --setcaps shadow-utils 2>/dev/null && \
     dnf -y install $INSTALL_RPMS --exclude container-selinux && \
-    npm install -g @openai/codex basedpyright && \
+    npm install -g @openai/codex@latest basedpyright@$BASEDPYRIGHT_NPM_VERSION && \
     dnf clean all && \
     if test -n "$SOURCE_DATE_EPOCH" ; then \
         sqlite3 /usr/lib/sysimage/libdnf5/transaction_history.sqlite "UPDATE trans SET dt_begin=$SOURCE_DATE_EPOCH, dt_end=$SOURCE_DATE_EPOCH; PRAGMA journal_mode=DELETE; PRAGMA journal_mode=WAL" ; \

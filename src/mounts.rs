@@ -2,12 +2,22 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::config::UserContext;
 use crate::env_mounts::EnvMountCandidate;
 use crate::errors::{CodexboxError, Result};
+use crate::user_context::UserContext;
 
 pub const GUEST_PODMAN_ROOT: &str = "/var/lib/containers";
 pub const GUEST_ADDITIONAL_IMAGE_STORE: &str = "/var/lib/shared";
+const CA_TRUST_PATHS: &[&str] = &[
+    "/etc/ssl/certs",
+    "/etc/pki/tls/certs",
+    "/etc/ca-certificates",
+    "/etc/ssl/cert.pem",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/ssl/ca-bundle.crt",
+    "/etc/pki/ca-trust",
+    "/etc/pki/tls/cert.pem",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountMode {
@@ -118,6 +128,17 @@ pub fn ca_mounts(paths: &[PathBuf]) -> Vec<MountSpec> {
         .collect()
 }
 
+pub fn discover_ca_trust_paths() -> Vec<PathBuf> {
+    let mut paths = CA_TRUST_PATHS
+        .iter()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 pub fn combine_mounts(groups: &[Vec<MountSpec>]) -> Vec<MountSpec> {
     let all = groups
         .iter()
@@ -145,7 +166,7 @@ pub fn mount_covers_path(mount: &MountSpec, path: &Path) -> bool {
         return false;
     }
 
-    let mount_is_dir = fs::symlink_metadata(&mount.host)
+    let mount_is_dir = fs::metadata(&mount.host)
         .map(|metadata| metadata.file_type().is_dir())
         .unwrap_or(false);
 
@@ -220,12 +241,12 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::config::UserContext;
     use crate::env_mounts::EnvMountCandidate;
+    use crate::user_context::UserContext;
 
     use super::{
-        base_mounts, filter_covered_env_candidates, prepare_runtime_dirs, MountMode,
-        GUEST_ADDITIONAL_IMAGE_STORE, GUEST_PODMAN_ROOT,
+        base_mounts, discover_ca_trust_paths, filter_covered_env_candidates, prepare_runtime_dirs,
+        MountMode, GUEST_ADDITIONAL_IMAGE_STORE, GUEST_PODMAN_ROOT,
     };
 
     #[test]
@@ -309,5 +330,19 @@ mod tests {
 
         assert!(home.join(".codex").is_dir());
         assert!(home.join(".local/share/codexbox/containers").is_dir());
+    }
+
+    #[test]
+    fn discover_ca_trust_paths_are_existing_and_unique() {
+        let paths = discover_ca_trust_paths();
+
+        for path in &paths {
+            assert!(path.exists());
+        }
+
+        let mut unique = paths.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(paths, unique);
     }
 }

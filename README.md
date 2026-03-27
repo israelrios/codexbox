@@ -11,7 +11,7 @@
 - Creates bind mounts for existing directories, files, and sockets referenced by forwarded environment variables so tools inside the sandbox can still reach them.
 - Automatically exports images built or pulled inside codexbox and imports them back into the host Podman image store after the run.
 - Can run a custom argv command inside the sandbox for validation and tests.
-- Can load user-level default port mappings and additional directories from `~/.codexbox-conf.json`.
+- Can load user-level default port mappings, env-filter rules, and additional directories from `~/.codexbox-conf.json`.
 - Embeds its container assets and default ignore list into the binary, so the built executable does not need sidecar config files.
 
 ## Requirements
@@ -58,7 +58,8 @@ User defaults can be defined in `~/.codexbox-conf.json`:
   "approved_paths": ["/run/user/1000/podman/podman.sock"],
   "publish": ["127.0.0.1:8080:80", "8443:443"],
   "add_dirs": ["~/shared", "/tmp/cache"],
-  "ignore_var_patterns": ["CUSTOM_*"],
+  "block_var_patterns": ["CUSTOM_*"],
+  "allow_var_patterns": ["SSH_AUTH_SOCK"],
   "directories": {
     "~/work/project": {
       "publish": ["3000:3000"],
@@ -71,7 +72,8 @@ User defaults can be defined in `~/.codexbox-conf.json`:
 - `approved_paths` stores one-time approvals for env-derived read-only mounts.
 - `publish` entries are passed to Podman as `--publish` values.
 - `add_dirs` entries are resolved relative to your home directory when needed.
-- `ignore_var_patterns` extends the built-in env-var ignore patterns with extra glob rules.
+- `block_var_patterns` extends the built-in env-var block list with extra glob rules.
+- `allow_var_patterns` re-allows vars that would otherwise be blocked by default or by `block_var_patterns`.
 - `directories` applies extra `publish` and `add_dirs` entries when you launch `codexbox` from that directory or one of its descendants.
 - Configured `add_dirs` are mounted automatically and appended to the Codex invocation as `--add-dir` entries.
 
@@ -88,22 +90,27 @@ cargo run -- --container-command podman info
 - Env vars whose values contain `://` are treated as URLs and never scanned for mount candidates.
 - New env-var-derived mounts still go through the one-time approval flow stored in `~/.codexbox-conf.json`.
 - Directories supplied with Codex `--add-dir` or from `~/.codexbox-conf.json` are mounted automatically and do not require approval.
-- The launcher rebuilds the Podman image automatically when the embedded container assets change or when the image is missing.
+- The launcher rebuilds the Podman image automatically when the embedded container assets change, when the image is older than 7 days, or when the image is missing.
+- Image rebuilds intentionally install the latest `@openai/codex` npm package.
 - When Podman inside codexbox builds or downloads images, `codexbox` exports those images at the end of the run and loads them into the host Podman image store automatically.
 
 ## Test
 
 ```bash
 cargo test
+cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
+shellcheck container-entrypoint.sh
 ```
 
 ## Project layout
 
 - `src/cli.rs` - CLI options
 - `src/launcher.rs` - launch orchestration
-- `src/podman.rs` - Podman command planning and execution
-- `src/mounts.rs` - mount planning
+- `src/podman/` - Podman image handling and command planning
+- `src/mounts.rs` - mount planning and CA trust discovery
+- `src/user_config.rs` - persisted config loading and effective config calculation
+- `src/user_context.rs` - user and working-directory detection
 - `container-entrypoint.sh` - container startup logic
 - `Containerfile` - sandbox image definition
 

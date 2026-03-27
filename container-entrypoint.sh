@@ -42,11 +42,20 @@ ln -snf "$XDG_RUNTIME_DIR/podman/podman.sock" /var/run/docker.sock
 podman system service --time=0 "$DOCKER_HOST" &
 service_pid=$!
 
+service_wait_attempts="${CODEXBOX_PODMAN_SERVICE_WAIT_ATTEMPTS:-50}"
+service_wait_delay="${CODEXBOX_PODMAN_SERVICE_WAIT_DELAY_SECS:-0.1}"
 i=0
-while [ ! -S "$XDG_RUNTIME_DIR/podman/podman.sock" ] && [ "$i" -lt 50 ]; do
+while [ ! -S "$XDG_RUNTIME_DIR/podman/podman.sock" ] && [ "$i" -lt "$service_wait_attempts" ]; do
     i=$((i + 1))
-    sleep 0.1
+    sleep "$service_wait_delay"
 done
+
+if [ ! -S "$XDG_RUNTIME_DIR/podman/podman.sock" ]; then
+    echo "codexbox: podman system service did not create $XDG_RUNTIME_DIR/podman/podman.sock" >&2
+    kill "$service_pid" 2>/dev/null || true
+    rm -f "$before_images_file" "$after_images_file" "$diff_images_file"
+    exit 1
+fi
 
 if [ "$#" -eq 0 ]; then
     set -- codex --dangerously-bypass-approvals-and-sandbox

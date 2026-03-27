@@ -2,9 +2,9 @@ use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use crate::config::{save_user_config, UserConfig};
 use crate::env_mounts::EnvMountCandidate;
 use crate::errors::{CodexboxError, Result};
+use crate::user_config::{save_user_config, UserConfig};
 
 pub trait ApprovalPrompt {
     fn confirm(&mut self, candidate: &EnvMountCandidate) -> Result<bool>;
@@ -95,8 +95,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{approve_candidates, approved_candidates, ApprovalPrompt};
-    use crate::config::{load_user_config, UserConfig};
     use crate::env_mounts::EnvMountCandidate;
+    use crate::user_config::{load_user_config, UserConfig};
 
     struct FixedPrompt {
         answers: RefCell<Vec<bool>>,

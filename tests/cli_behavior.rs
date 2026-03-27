@@ -1,51 +1,22 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use codexbox::podman::embedded_image_fingerprint;
 use tempfile::tempdir;
 
 fn codexbox_bin() -> &'static str {
     env!("CARGO_BIN_EXE_codexbox")
 }
 
-fn embedded_image_fingerprint() -> String {
-    let mut hash = Fnv1a64::new();
-
-    for chunk in [
-        env!("CARGO_PKG_VERSION").as_bytes(),
-        include_str!("../Containerfile").as_bytes(),
-        include_bytes!("../containers.conf").as_slice(),
-        include_bytes!("../podman-containers.conf").as_slice(),
-        include_bytes!("../container-entrypoint.sh").as_slice(),
-    ] {
-        hash.write(chunk);
-        hash.write(&[0]);
-    }
-
-    format!("{:016x}", hash.finish())
-}
-
-struct Fnv1a64(u64);
-
-impl Fnv1a64 {
-    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-
-    fn new() -> Self {
-        Self(Self::OFFSET_BASIS)
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 ^= u64::from(*byte);
-            self.0 = self.0.wrapping_mul(Self::PRIME);
-        }
-    }
-
-    fn finish(self) -> u64 {
-        self.0
-    }
+fn current_unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 fn run_codexbox(
@@ -88,7 +59,7 @@ if [ "$1" = "image" ] && [ "$2" = "exists" ]; then
 fi
 
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
-    printf '%s' "${CODEXBOX_TEST_IMAGE_FINGERPRINT_RESPONSE:-}"
+    printf '%s' "${CODEXBOX_TEST_IMAGE_INSPECT_RESPONSE:-}"
     exit 0
 fi
 
@@ -208,9 +179,51 @@ fn dry_run_filters_internal_env_and_url_mount_detection() {
     let stdout = String::from_utf8(output.stdout).unwrap();
 
     assert!(output.status.success());
-    assert!(stdout.contains("--env CODEXBOX_PATH_PREFIX=/bin"));
+    assert!(!stdout.contains("CODEXBOX_PATH_PREFIX"));
     assert!(!stdout.contains("/host/prefix"));
     assert!(!stdout.contains("src=//tmp"));
+    assert!(!stdout.contains("src=/bin,target=/bin"));
+    assert!(!stdout.contains("src=/sbin,target=/sbin"));
+}
+
+#[test]
+fn allow_var_patterns_can_forward_approved_ssh_socket() {
+    let dir = tempdir().unwrap();
+    let home_dir = dir.path().join("home");
+    let workspace = dir.path().join("workspace");
+    let ssh_socket = dir.path().join("agent.sock");
+    fs::create_dir_all(&home_dir).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    let _listener = UnixListener::bind(&ssh_socket).unwrap();
+
+    fs::write(
+        home_dir.join(".codexbox-conf.json"),
+        format!(
+            r#"{{
+  "approved_paths": ["{}"],
+  "block_var_patterns": ["SSH*"],
+  "allow_var_patterns": ["SSH_AUTH_SOCK"]
+}}"#,
+            ssh_socket.display()
+        ),
+    )
+    .unwrap();
+
+    let output = run_codexbox(
+        &home_dir,
+        &workspace,
+        &["--dry-run"],
+        &[("SSH_AUTH_SOCK", &ssh_socket.to_string_lossy())],
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert!(stdout.contains(&format!("--env SSH_AUTH_SOCK={}", ssh_socket.display())));
+    assert!(stdout.contains(&format!(
+        "src={},target={},ro",
+        ssh_socket.display(),
+        ssh_socket.display()
+    )));
 }
 
 #[test]
@@ -237,8 +250,12 @@ fn fresh_image_skips_rebuild() {
         .env("LANG", "C.UTF-8")
         .env("CODEXBOX_TEST_PODMAN_LOG", &podman_log)
         .env(
-            "CODEXBOX_TEST_IMAGE_FINGERPRINT_RESPONSE",
-            embedded_image_fingerprint(),
+            "CODEXBOX_TEST_IMAGE_INSPECT_RESPONSE",
+            format!(
+                "{}|{}",
+                embedded_image_fingerprint(),
+                current_unix_timestamp()
+            ),
         )
         .output()
         .unwrap();
@@ -273,7 +290,10 @@ fn stale_image_triggers_rebuild() {
         .env("PATH", path)
         .env("LANG", "C.UTF-8")
         .env("CODEXBOX_TEST_PODMAN_LOG", &podman_log)
-        .env("CODEXBOX_TEST_IMAGE_FINGERPRINT_RESPONSE", "stale")
+        .env(
+            "CODEXBOX_TEST_IMAGE_INSPECT_RESPONSE",
+            format!("{}|0", embedded_image_fingerprint()),
+        )
         .output()
         .unwrap();
     let log = fs::read_to_string(&podman_log).unwrap();
@@ -307,7 +327,14 @@ fn run_uses_argv_container_command_without_shell_env_channel() {
         .env("PATH", path)
         .env("LANG", "C.UTF-8")
         .env("CODEXBOX_TEST_PODMAN_LOG", &podman_log)
-        .env("CODEXBOX_TEST_IMAGE_FINGERPRINT_RESPONSE", "stale")
+        .env(
+            "CODEXBOX_TEST_IMAGE_INSPECT_RESPONSE",
+            format!(
+                "{}|{}",
+                embedded_image_fingerprint(),
+                current_unix_timestamp()
+            ),
+        )
         .output()
         .unwrap();
     let log = fs::read_to_string(&podman_log).unwrap();

@@ -2,12 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use nix::unistd::{getgid, getuid};
 use serde::{Deserialize, Serialize};
 
+use crate::env_filter::EnvFilterConfig;
 use crate::errors::{CodexboxError, Result};
+use crate::user_context::UserContext;
 
-const DEFAULT_IGNORE_VAR_PATTERNS: &[&str] = &[
+const DEFAULT_BLOCKED_VAR_PATTERNS: &[&str] = &[
     "BASH*",
     "COLUMNS",
     "COMP_WORDBREAKS",
@@ -65,7 +66,7 @@ const DEFAULT_IGNORE_VAR_PATTERNS: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub struct LauncherConfig {
-    pub ignore_var_patterns: Vec<String>,
+    pub env_filter: EnvFilterConfig,
     pub config_path: PathBuf,
     pub user_config: UserConfig,
     pub effective_config: EffectiveUserConfig,
@@ -80,7 +81,9 @@ pub struct UserConfig {
     #[serde(default)]
     pub add_dirs: Vec<PathBuf>,
     #[serde(default)]
-    pub ignore_var_patterns: Vec<String>,
+    pub block_var_patterns: Vec<String>,
+    #[serde(default)]
+    pub allow_var_patterns: Vec<String>,
     #[serde(default)]
     pub directories: BTreeMap<String, DirectoryConfig>,
 }
@@ -98,31 +101,6 @@ pub struct EffectiveUserConfig {
     pub approved_paths: BTreeSet<PathBuf>,
     pub publish: Vec<String>,
     pub add_dirs: Vec<PathBuf>,
-}
-
-#[derive(Debug, Clone)]
-pub struct UserContext {
-    pub uid: u32,
-    pub gid: u32,
-    pub home_dir: PathBuf,
-    pub cwd: PathBuf,
-}
-
-impl UserContext {
-    pub fn detect() -> Result<Self> {
-        let home_dir = home::home_dir().ok_or(CodexboxError::MissingHomeDir)?;
-        let cwd = std::env::current_dir().map_err(|source| CodexboxError::ReadPath {
-            path: PathBuf::from("."),
-            source,
-        })?;
-
-        Ok(Self {
-            uid: getuid().as_raw(),
-            gid: getgid().as_raw(),
-            home_dir,
-            cwd,
-        })
-    }
 }
 
 impl UserConfig {
@@ -147,8 +125,8 @@ impl UserConfig {
         matching_overrides.sort_by_key(|(depth, _)| *depth);
 
         for (_, config) in matching_overrides {
-            merge_string_values(&mut effective.publish, &config.publish);
-            merge_path_values(&mut effective.add_dirs, &config.add_dirs);
+            merge_unique(&mut effective.publish, &config.publish);
+            merge_unique(&mut effective.add_dirs, &config.add_dirs);
         }
 
         effective
@@ -159,11 +137,16 @@ pub fn load_launcher_config(user: &UserContext) -> Result<LauncherConfig> {
     let config_path = user.home_dir.join(".codexbox-conf.json");
     let user_config = load_user_config(&config_path)?;
     let effective_config = user_config.effective_for(&user.cwd, &user.home_dir);
-    let mut ignore_var_patterns = default_ignore_var_patterns();
-    merge_string_values(&mut ignore_var_patterns, &user_config.ignore_var_patterns);
+    let mut blocked_patterns = default_blocked_var_patterns();
+    merge_unique(&mut blocked_patterns, &user_config.block_var_patterns);
+    let mut allowed_patterns = Vec::new();
+    merge_unique(&mut allowed_patterns, &user_config.allow_var_patterns);
 
     Ok(LauncherConfig {
-        ignore_var_patterns,
+        env_filter: EnvFilterConfig {
+            blocked_patterns,
+            allowed_patterns,
+        },
         config_path,
         user_config,
         effective_config,
@@ -203,22 +186,14 @@ pub fn save_user_config(path: &Path, config: &UserConfig) -> Result<()> {
     })
 }
 
-fn default_ignore_var_patterns() -> Vec<String> {
-    DEFAULT_IGNORE_VAR_PATTERNS
+fn default_blocked_var_patterns() -> Vec<String> {
+    DEFAULT_BLOCKED_VAR_PATTERNS
         .iter()
         .map(|pattern| (*pattern).to_string())
         .collect()
 }
 
-fn merge_string_values(target: &mut Vec<String>, entries: &[String]) {
-    for entry in entries {
-        if !target.contains(entry) {
-            target.push(entry.clone());
-        }
-    }
-}
-
-fn merge_path_values(target: &mut Vec<PathBuf>, entries: &[PathBuf]) {
+fn merge_unique<T: PartialEq + Clone>(target: &mut Vec<T>, entries: &[T]) {
     for entry in entries {
         if !target.contains(entry) {
             target.push(entry.clone());
@@ -250,22 +225,23 @@ fn canonicalize_if_possible(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::fs;
     use std::path::PathBuf;
 
     use tempfile::tempdir;
 
-    use std::fs;
-
     use super::{
-        default_ignore_var_patterns, load_launcher_config, load_user_config, save_user_config,
-        DirectoryConfig, EffectiveUserConfig, UserConfig, UserContext,
+        default_blocked_var_patterns, load_launcher_config, load_user_config, save_user_config,
+        DirectoryConfig, EffectiveUserConfig, UserConfig,
     };
+    use crate::user_context::UserContext;
 
     #[test]
-    fn default_ignore_patterns_include_reserved_namespace() {
-        let patterns = default_ignore_var_patterns();
+    fn default_blocked_patterns_include_internal_namespace() {
+        let patterns = default_blocked_var_patterns();
 
         assert!(patterns.contains(&"CODEXBOX_*".to_string()));
+        assert!(patterns.contains(&"HOME".to_string()));
         assert!(patterns.contains(&"SSH*".to_string()));
     }
 
@@ -290,7 +266,8 @@ mod tests {
             ]),
             publish: vec!["127.0.0.1:8080:80".into(), "8443:443".into()],
             add_dirs: vec![PathBuf::from("~/shared"), PathBuf::from("/tmp/cache")],
-            ignore_var_patterns: vec!["CUSTOM_*".into()],
+            block_var_patterns: vec!["CUSTOM_*".into()],
+            allow_var_patterns: vec!["SSH_AUTH_SOCK".into()],
             directories: BTreeMap::from([(
                 "~/project".into(),
                 DirectoryConfig {
@@ -305,6 +282,8 @@ mod tests {
         let loaded = load_user_config(&path).unwrap();
 
         assert!(saved.contains("\"approved_paths\""));
+        assert!(saved.contains("\"block_var_patterns\""));
+        assert!(saved.contains("\"allow_var_patterns\""));
         assert!(saved.contains("\"directories\""));
         assert_eq!(loaded, config);
     }
@@ -320,7 +299,8 @@ mod tests {
             approved_paths: BTreeSet::from([PathBuf::from("/tmp/global.sock")]),
             publish: vec!["127.0.0.1:8080:80".into()],
             add_dirs: vec![PathBuf::from("~/shared")],
-            ignore_var_patterns: Vec::new(),
+            block_var_patterns: Vec::new(),
+            allow_var_patterns: Vec::new(),
             directories: BTreeMap::from([
                 (
                     "~/work".into(),
@@ -360,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn launcher_config_merges_default_and_user_ignore_patterns() {
+    fn launcher_config_merges_default_blocked_and_user_overrides() {
         let dir = tempdir().unwrap();
         let home = dir.path().join("home");
         let cwd = dir.path().join("workspace");
@@ -369,7 +349,8 @@ mod tests {
         fs::write(
             home.join(".codexbox-conf.json"),
             r#"{
-  "ignore_var_patterns": ["CUSTOM_*", "SSH*"]
+  "block_var_patterns": ["CUSTOM_*", "HOME"],
+  "allow_var_patterns": ["SSH_AUTH_SOCK", "SSH_AUTH_SOCK"]
 }
 "#,
         )
@@ -383,15 +364,26 @@ mod tests {
         })
         .unwrap();
 
-        assert!(config.ignore_var_patterns.contains(&"CUSTOM_*".to_string()));
-        assert!(config.ignore_var_patterns.contains(&"SSH*".to_string()));
+        assert!(config
+            .env_filter
+            .blocked_patterns
+            .contains(&"CUSTOM_*".to_string()));
+        assert!(config
+            .env_filter
+            .blocked_patterns
+            .contains(&"HOME".to_string()));
         assert_eq!(
             config
-                .ignore_var_patterns
+                .env_filter
+                .blocked_patterns
                 .iter()
-                .filter(|pattern| pattern.as_str() == "SSH*")
+                .filter(|pattern| pattern.as_str() == "HOME")
                 .count(),
             1
+        );
+        assert_eq!(
+            config.env_filter.allowed_patterns,
+            vec!["SSH_AUTH_SOCK".to_string()]
         );
     }
 }
