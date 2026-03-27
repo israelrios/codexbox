@@ -70,7 +70,7 @@ pub fn base_mounts(user: &UserContext, writable_roots: &[PathBuf]) -> Result<Vec
             mounts.push(MountSpec {
                 host: path.clone(),
                 guest: path,
-                mode: MountMode::ReadOnly,
+                mode: MountMode::ReadWrite,
                 source: MountSource::Fixed,
             });
         }
