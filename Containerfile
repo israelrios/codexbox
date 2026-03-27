@@ -17,7 +17,7 @@ FROM registry.fedoraproject.org/fedora:43
 RUN echo -e "\n\n# Added during image build" >> /etc/dnf/dnf.conf && \
     echo -e "minrate=100\ntimeout=60\n" >> /etc/dnf/dnf.conf
 
-ARG INSTALL_RPMS="podman podman-docker bubblewrap fuse-overlayfs slirp4netns passt openssh-clients cpp git-core sqlite python3 python3-pip python3-pytest nodejs ripgrep jq gcc gcc-c++ make procps-ng gh glab"
+ARG INSTALL_RPMS="podman podman-docker bubblewrap fuse-overlayfs slirp4netns passt openssh-clients cpp git-core sqlite python3 python3-pip python3-pytest nodejs ripgrep jq gcc gcc-c++ make procps-ng gh glab ShellCheck"
 ARG BASEDPYRIGHT_NPM_VERSION="1.38.4"
 
 # Don't include container-selinux and remove
