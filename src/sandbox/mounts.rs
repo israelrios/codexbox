@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::env_mounts::EnvMountCandidate;
 use crate::errors::{CodexboxError, Result};
+use crate::sandbox::env_mounts::EnvMountCandidate;
 use crate::user_context::UserContext;
 
 pub const GUEST_PODMAN_ROOT: &str = "/var/lib/containers";
@@ -241,7 +241,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::env_mounts::EnvMountCandidate;
+    use crate::sandbox::env_mounts::EnvMountCandidate;
     use crate::user_context::UserContext;
 
     use super::{

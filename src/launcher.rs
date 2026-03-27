@@ -1,21 +1,20 @@
 use std::path::PathBuf;
 
-use crate::add_dirs::{add_dir_mounts, plan_default_codex_command};
-use crate::approval::{approve_candidates, approved_candidates, StdioApprovalPrompt};
 use crate::cli::Cli;
-use crate::codex_config::{existing_writable_roots, load_codex_toml};
-use crate::env_filter::{filter_environment, ForwardedEnv};
-use crate::env_mounts::{discover_env_mount_candidates, EnvMountCandidate};
+use crate::config::{existing_writable_roots, load_codex_toml, load_launcher_config, PublishSpec};
 use crate::errors::Result;
-use crate::mounts::{
-    approved_env_mounts, base_mounts, ca_mounts, combine_mounts, discover_ca_trust_paths,
-    filter_covered_env_candidates, prepare_runtime_dirs, MountMode, MountSource, MountSpec,
-};
 use crate::podman::{
     create_image_export_dir, dry_run_image_export_dir, ensure_image, image_export_env,
     import_exported_images, render_plan, run_plan, PodmanPlan, DEFAULT_IMAGE,
 };
-use crate::user_config::load_launcher_config;
+use crate::sandbox::add_dirs::{add_dir_mounts, plan_default_codex_command};
+use crate::sandbox::approval::{approve_candidates, approved_candidates, StdioApprovalPrompt};
+use crate::sandbox::env_filter::{filter_environment, ForwardedEnv};
+use crate::sandbox::env_mounts::{discover_env_mount_candidates, EnvMountCandidate};
+use crate::sandbox::mounts::{
+    approved_env_mounts, base_mounts, ca_mounts, combine_mounts, discover_ca_trust_paths,
+    filter_covered_env_candidates, prepare_runtime_dirs, MountMode, MountSource, MountSpec,
+};
 use crate::user_context::UserContext;
 
 pub fn launch(cli: Cli) -> Result<i32> {
@@ -104,7 +103,7 @@ pub fn launch(cli: Cli) -> Result<i32> {
 struct PlanRequest<'a> {
     user: &'a UserContext,
     image: String,
-    publish: Vec<String>,
+    publish: Vec<PublishSpec>,
     filtered_env: ForwardedEnv,
     base_mounts: Vec<MountSpec>,
     approved_candidates: &'a [EnvMountCandidate],
@@ -137,7 +136,10 @@ fn build_plan(request: PlanRequest<'_>) -> PodmanPlan {
     }
 }
 
-fn merge_publish(configured_publish: &[String], cli_publish: Vec<String>) -> Vec<String> {
+fn merge_publish(
+    configured_publish: &[PublishSpec],
+    cli_publish: Vec<PublishSpec>,
+) -> Vec<PublishSpec> {
     let mut publish = Vec::new();
 
     for entry in configured_publish.iter().chain(cli_publish.iter()) {
@@ -151,15 +153,32 @@ fn merge_publish(configured_publish: &[String], cli_publish: Vec<String>) -> Vec
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
+    use crate::config::PublishSpec;
+
     use super::merge_publish;
 
     #[test]
     fn merge_publish_keeps_order_and_deduplicates() {
         let publish = merge_publish(
-            &["127.0.0.1:8080:80".into(), "8443:443".into()],
-            vec!["8443:443".into(), "3000:3000".into()],
+            &[
+                PublishSpec::from_str("127.0.0.1:8080:80").unwrap(),
+                PublishSpec::from_str("8443:443").unwrap(),
+            ],
+            vec![
+                PublishSpec::from_str("8443:443").unwrap(),
+                PublishSpec::from_str("3000:3000").unwrap(),
+            ],
         );
 
-        assert_eq!(publish, vec!["127.0.0.1:8080:80", "8443:443", "3000:3000"]);
+        assert_eq!(
+            publish,
+            vec![
+                PublishSpec::from_str("127.0.0.1:8080:80").unwrap(),
+                PublishSpec::from_str("8443:443").unwrap(),
+                PublishSpec::from_str("3000:3000").unwrap()
+            ]
+        );
     }
 }

@@ -34,6 +34,9 @@ pub enum CodexboxError {
         source: serde_json::Error,
     },
 
+    #[error("invalid config in {path}: {message}")]
+    InvalidConfig { path: PathBuf, message: String },
+
     #[error("failed to serialize approval database: {0}")]
     SerializeJson(#[from] serde_json::Error),
 

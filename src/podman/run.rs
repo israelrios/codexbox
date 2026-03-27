@@ -2,9 +2,10 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::Command;
 
-use crate::env_filter::ForwardedEnv;
+use crate::config::PublishSpec;
 use crate::errors::{CodexboxError, Result};
-use crate::mounts::{MountMode, MountSpec};
+use crate::sandbox::env_filter::ForwardedEnv;
+use crate::sandbox::mounts::{MountMode, MountSpec};
 use crate::user_context::UserContext;
 
 const PATH_PREFIX_ENV: &str = "CODEXBOX_PATH_PREFIX";
@@ -13,7 +14,7 @@ const PATH_PREFIX_ENV: &str = "CODEXBOX_PATH_PREFIX";
 pub struct PodmanPlan {
     pub image: String,
     pub mounts: Vec<MountSpec>,
-    pub publish: Vec<String>,
+    pub publish: Vec<PublishSpec>,
     pub env: ForwardedEnv,
     pub extra_env: Vec<(String, String)>,
     pub command: Vec<String>,
@@ -51,15 +52,13 @@ fn build_command(plan: &PodmanPlan, user: &UserContext) -> Command {
         .arg("/dev/fuse")
         .arg("--workdir")
         .arg(&plan.workdir)
-        .arg("--hostname")
-        .arg("codexbox")
         .arg("--annotation")
         .arg(format!("codexbox.uid={}", user.uid))
         .arg("--annotation")
         .arg(format!("codexbox.gid={}", user.gid));
 
     for publish in &plan.publish {
-        command.arg("--publish").arg(publish);
+        command.arg("--publish").arg(publish.to_string());
     }
 
     for mount in &plan.mounts {
@@ -136,9 +135,11 @@ fn shell_quote(value: &std::ffi::OsStr) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::str::FromStr;
 
-    use crate::env_filter::ForwardedEnv;
-    use crate::mounts::{MountMode, MountSource, MountSpec};
+    use crate::config::PublishSpec;
+    use crate::sandbox::env_filter::ForwardedEnv;
+    use crate::sandbox::mounts::{MountMode, MountSource, MountSpec};
     use crate::user_context::UserContext;
 
     use super::{format_mount, render_plan, PodmanPlan};
@@ -186,7 +187,7 @@ mod tests {
                 mode: MountMode::ReadWrite,
                 source: MountSource::Fixed,
             }],
-            publish: vec!["127.0.0.1:8080:80".into()],
+            publish: vec![PublishSpec::from_str("127.0.0.1:8080:80").unwrap()],
             env: ForwardedEnv {
                 vars: Default::default(),
                 path_prefix: Some("/opt/bin:/custom/bin".into()),
@@ -215,6 +216,7 @@ mod tests {
         assert!(
             rendered.contains("--env CODEXBOX_IMAGE_EXPORT_DIR=/var/lib/codexbox-image-exports")
         );
+        assert!(!rendered.contains("--hostname"));
         assert!(!rendered.contains("--env PATH="));
         assert!(!rendered.contains("--security-opt"));
         assert!(rendered.contains(
@@ -233,7 +235,7 @@ mod tests {
         let plan = PodmanPlan {
             image: "localhost/codexbox:latest".into(),
             mounts: Vec::new(),
-            publish: vec!["9090:90".into()],
+            publish: vec![PublishSpec::from_str("9090:90").unwrap()],
             env: ForwardedEnv {
                 vars: Default::default(),
                 path_prefix: None,

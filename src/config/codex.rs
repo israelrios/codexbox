@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::errors::{CodexboxError, Result};
+use crate::path_utils::{canonicalize_if_possible, expand_tilde};
 
 #[derive(Debug, Default, Deserialize)]
 pub struct CodexToml {
@@ -39,9 +40,7 @@ pub fn existing_writable_roots(config: &CodexToml, home_dir: &Path) -> Vec<PathB
         .into_iter()
         .flatten()
     {
-        let Some(expanded) = expand_tilde(root, home_dir) else {
-            continue;
-        };
+        let expanded = expand_tilde(root, home_dir);
 
         if !expanded.is_absolute() {
             eprintln!(
@@ -61,23 +60,6 @@ pub fn existing_writable_roots(config: &CodexToml, home_dir: &Path) -> Vec<PathB
     roots.sort();
     roots.dedup();
     roots
-}
-
-fn expand_tilde(path: &Path, home_dir: &Path) -> Option<PathBuf> {
-    let raw = path.to_string_lossy();
-    if raw == "~" {
-        return Some(home_dir.to_path_buf());
-    }
-
-    if let Some(stripped) = raw.strip_prefix("~/") {
-        return Some(home_dir.join(stripped));
-    }
-
-    Some(path.to_path_buf())
-}
-
-fn canonicalize_if_possible(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]

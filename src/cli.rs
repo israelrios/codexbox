@@ -1,5 +1,7 @@
 use clap::Parser;
 
+use crate::config::PublishSpec;
+
 #[derive(Debug, Parser)]
 #[command(name = "codexbox", about = "Launch Codex inside a Podman sandbox")]
 pub struct Cli {
@@ -20,10 +22,10 @@ pub struct Cli {
     #[arg(
         short = 'p',
         long,
-        value_name = "PORT",
-        help = "Publish a port with podman syntax (repeatable)"
+        value_name = "PUBLISH",
+        help = "Publish a port as [HOST_IP:]HOST_PORT:CONTAINER_PORT[/udp] (repeatable)"
     )]
-    pub publish: Vec<String>,
+    pub publish: Vec<PublishSpec>,
 
     #[arg(
         long,

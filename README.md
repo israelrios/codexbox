@@ -56,26 +56,32 @@ User defaults can be defined in `~/.codexbox-conf.json`:
 ```json
 {
   "approved_paths": ["/run/user/1000/podman/podman.sock"],
-  "publish": ["127.0.0.1:8080:80", "8443:443"],
+  "publish": [
+    { "host_ip": "127.0.0.1", "host_port": 8080, "container_port": 80 },
+    { "host_port": 8443, "container_port": 443 }
+  ],
   "add_dirs": ["~/shared", "/tmp/cache"],
   "block_var_patterns": ["CUSTOM_*"],
   "allow_var_patterns": ["SSH_AUTH_SOCK"],
-  "directories": {
-    "~/work/project": {
-      "publish": ["3000:3000"],
+  "directory_rules": [
+    {
+      "path": "~/work/project",
+      "publish": [{ "host_port": 3000, "container_port": 3000 }],
       "add_dirs": ["~/project-extra"]
     }
-  }
+  ]
 }
 ```
 
 - `approved_paths` stores one-time approvals for env-derived read-only mounts.
-- `publish` entries are passed to Podman as `--publish` values.
+- `publish` entries are strict objects instead of free-form strings.
 - `add_dirs` entries are resolved relative to your home directory when needed.
 - `block_var_patterns` extends the built-in env-var block list with extra glob rules.
 - `allow_var_patterns` re-allows vars that would otherwise be blocked by default or by `block_var_patterns`.
-- `directories` applies extra `publish` and `add_dirs` entries when you launch `codexbox` from that directory or one of its descendants.
+- `directory_rules` applies extra `publish` and `add_dirs` entries when you launch `codexbox` from that directory or one of its descendants.
 - Configured `add_dirs` are mounted automatically and appended to the Codex invocation as `--add-dir` entries.
+
+CLI `-p/--publish` accepts `CONTAINER_PORT`, `HOST_PORT:CONTAINER_PORT`, or `HOST_IP:HOST_PORT:CONTAINER_PORT`, with optional `/udp`.
 
 Run an argv command inside the sandbox instead of `codex`:
 
@@ -107,9 +113,9 @@ shellcheck container-entrypoint.sh
 
 - `src/cli.rs` - CLI options
 - `src/launcher.rs` - launch orchestration
+- `src/config/` - Codexbox and Codex config parsing
 - `src/podman/` - Podman image handling and command planning
-- `src/mounts.rs` - mount planning and CA trust discovery
-- `src/user_config.rs` - persisted config loading and effective config calculation
+- `src/sandbox/` - environment filtering, mount planning, and approval flow
 - `src/user_context.rs` - user and working-directory detection
 - `container-entrypoint.sh` - container startup logic
 - `Containerfile` - sandbox image definition

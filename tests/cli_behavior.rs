@@ -107,7 +107,12 @@ fn user_config_supplies_defaults_and_repo_config_is_ignored() {
         format!(
             r#"{{
   "approved_paths": ["/tmp/global.sock"],
-  "publish": ["9090:90"],
+  "publish": [
+    {{
+      "host_port": 9090,
+      "container_port": 90
+    }}
+  ],
   "add_dirs": ["{}"]
 }}"#,
             "~/shared"
@@ -138,12 +143,18 @@ fn directory_overrides_apply_publish_and_add_dirs() {
         home_dir.join(".codexbox-conf.json"),
         format!(
             r#"{{
-  "directories": {{
-    "{}": {{
-      "publish": ["3000:3000"],
+  "directory_rules": [
+    {{
+      "path": "{}",
+      "publish": [
+        {{
+          "host_port": 3000,
+          "container_port": 3000
+        }}
+      ],
       "add_dirs": ["{}"]
     }}
-  }}
+  ]
 }}"#,
             "~/work/project", "~/project-extra"
         ),

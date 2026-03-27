@@ -3,7 +3,8 @@ use std::fs;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
-use crate::env_filter::ForwardedEnv;
+use crate::path_utils::canonicalize_if_possible;
+use crate::sandbox::env_filter::ForwardedEnv;
 
 const FORBIDDEN_ENV_MOUNT_DIRS: &[&str] = &["/bin", "/sbin", "/usr/bin", "/usr/sbin"];
 
@@ -74,10 +75,6 @@ fn is_forbidden_env_mount(path: &Path, home_dir: &Path) -> bool {
         || is_forbidden_system_mount_path(&canonical_path)
 }
 
-fn canonicalize_if_possible(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
 fn is_forbidden_system_mount_path(path: &Path) -> bool {
     FORBIDDEN_ENV_MOUNT_DIRS.iter().any(|dir| {
         let dir = Path::new(dir);
@@ -102,7 +99,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::env_filter::ForwardedEnv;
+    use crate::sandbox::env_filter::ForwardedEnv;
 
     use super::{discover_env_mount_candidates, is_forbidden_env_mount, EnvMountCandidate};
 

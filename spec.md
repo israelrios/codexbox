@@ -65,34 +65,38 @@ Schema:
 ```json
 {
   "approved_paths": ["/run/user/1000/podman/podman.sock"],
-  "publish": ["127.0.0.1:8080:80"],
+  "publish": [
+    { "host_ip": "127.0.0.1", "host_port": 8080, "container_port": 80 }
+  ],
   "add_dirs": ["~/shared"],
   "block_var_patterns": ["MY_SECRET_*"],
   "allow_var_patterns": ["SSH_AUTH_SOCK"],
-  "directories": {
-    "~/work/project": {
-      "publish": ["3000:3000"],
+  "directory_rules": [
+    {
+      "path": "~/work/project",
+      "publish": [{ "host_port": 3000, "container_port": 3000 }],
       "add_dirs": ["~/project-extra"]
     }
-  }
+  ]
 }
 ```
 
 Rules:
 
 - `approved_paths` stores globally approved read-only env-derived mounts
-- `publish` adds Podman `--publish` entries
+- `publish` adds validated port mappings
 - `add_dirs` adds extra writable directory mounts and matching `codex --add-dir` arguments
 - `block_var_patterns` extends the built-in environment block list
 - `allow_var_patterns` re-allows variables blocked by default or by `block_var_patterns`
-- `directories` provides per-directory overrides for `publish` and `add_dirs` only
+- `directory_rules` provides per-directory overrides for `publish` and `add_dirs` only
 
 Path handling:
 
 - `~` expands to the invoking user home directory
 - top-level config paths that are not absolute are resolved from the home directory
+- config parsing is strict: unknown fields are rejected
 - CLI `--add-dir` relative paths are resolved from the current working directory
-- configured directory overrides apply when the current working directory is inside the configured directory
+- configured directory rules apply when the current working directory is inside the configured directory
 - if multiple directory overrides match, they are merged from shallowest match to deepest match
 
 There is no per-directory `approved_paths`.

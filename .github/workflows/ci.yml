@@ -13,9 +13,12 @@ jobs:
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y shellcheck podman uidmap slirp4netns
       - run: cargo fmt --check
       - run: cargo test --all-targets
       - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: sudo apt-get update
-      - run: sudo apt-get install -y shellcheck
       - run: shellcheck container-entrypoint.sh
+      - env:
+          CODEXBOX_RUN_PODMAN_SMOKE: "1"
+        run: cargo test --test podman_smoke -- --nocapture

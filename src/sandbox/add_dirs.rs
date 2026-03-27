@@ -1,7 +1,7 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::mounts::{MountMode, MountSource, MountSpec};
+use crate::path_utils::{canonicalize_if_possible, resolve_from_base};
+use crate::sandbox::mounts::{MountMode, MountSource, MountSpec};
 use crate::user_context::UserContext;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,28 +118,9 @@ fn push_add_dir(add_dirs: &mut Vec<PathBuf>, path: PathBuf, base_dir: &Path, hom
 }
 
 fn normalize_add_dir(path: PathBuf, base_dir: &Path, home_dir: &Path) -> Option<PathBuf> {
-    let path = expand_tilde(path, home_dir);
-    let path = if path.is_absolute() {
-        path
-    } else {
-        base_dir.join(path)
-    };
-
-    let path = fs::canonicalize(&path).unwrap_or(path);
+    let path = resolve_from_base(&path, base_dir, home_dir);
+    let path = canonicalize_if_possible(&path);
     path.is_dir().then_some(path)
-}
-
-fn expand_tilde(path: PathBuf, home_dir: &Path) -> PathBuf {
-    let raw = path.to_string_lossy();
-    if raw == "~" {
-        return home_dir.to_path_buf();
-    }
-
-    if let Some(stripped) = raw.strip_prefix("~/") {
-        return home_dir.join(stripped);
-    }
-
-    path
 }
 
 #[cfg(test)]
@@ -153,7 +134,7 @@ mod tests {
         add_dir_mounts, codex_command, extend_codex_args_with_add_dirs, extract_add_dir_paths,
         plan_default_codex_command, resolve_add_dir_paths,
     };
-    use crate::mounts::{MountMode, MountSource};
+    use crate::sandbox::mounts::{MountMode, MountSource};
     use crate::user_context::UserContext;
 
     #[test]
