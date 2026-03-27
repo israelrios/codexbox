@@ -20,6 +20,13 @@ if [ "${HOME:-}" != "" ] && [ "$HOME" != "/root" ]; then
     if [ -L "$home_containers_dir" ] || [ ! -e "$home_containers_dir" ]; then
         ln -snf /root/.config/containers "$home_containers_dir"
     fi
+
+    for shell_init in .bashrc .bash_profile; do
+        home_shell_init="$HOME/$shell_init"
+        if [ ! -e "$home_shell_init" ] && [ ! -L "$home_shell_init" ]; then
+            ln -s "/root/$shell_init" "$home_shell_init"
+        fi
+    done
 fi
 
 before_images_file=

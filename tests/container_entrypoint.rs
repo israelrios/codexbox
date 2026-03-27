@@ -141,3 +141,47 @@ exit 0
         .unwrap()
         .contains("SAVE:app:latest"));
 }
+
+#[test]
+fn entrypoint_links_root_bash_init_files_when_missing() {
+    let dir = tempdir().unwrap();
+    let fake_bin = dir.path().join("fake-bin");
+    let home_dir = dir.path().join("home");
+    let runtime_dir = dir.path().join("runtime");
+    let socket_dir = runtime_dir.join("podman");
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+    fs::create_dir_all(&socket_dir).unwrap();
+    let _socket = UnixListener::bind(socket_dir.join("podman.sock")).unwrap();
+
+    fs::write(home_dir.join(".bash_profile"), "existing profile").unwrap();
+
+    write_fake_podman(
+        &fake_bin.join("podman"),
+        r#"#!/bin/sh
+if [ "$1" = "system" ] && [ "$2" = "service" ]; then
+    exit 0
+fi
+exit 0
+"#,
+    );
+
+    let output = Command::new("/bin/sh")
+        .arg(entrypoint_path())
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("true")
+        .env_clear()
+        .env("HOME", &home_dir)
+        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(fs::read_link(home_dir.join(".bashrc")).unwrap(), PathBuf::from("/root/.bashrc"));
+    assert_eq!(
+        fs::read_to_string(home_dir.join(".bash_profile")).unwrap(),
+        "existing profile"
+    );
+}
