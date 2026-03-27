@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -12,13 +12,28 @@ const FORBIDDEN_ENV_MOUNT_DIRS: &[&str] = &["/bin", "/sbin", "/usr/bin", "/usr/s
 pub struct EnvMountCandidate {
     pub var_name: String,
     pub host_path: PathBuf,
+    pub kind: EnvMountKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EnvMountKind {
+    File,
+    Directory,
+    Socket,
+}
+
+impl EnvMountCandidate {
+    pub fn is_socket(&self) -> bool {
+        self.kind == EnvMountKind::Socket
+    }
 }
 
 pub fn discover_env_mount_candidates(
     env: &ForwardedEnv,
     home_dir: &Path,
 ) -> Vec<EnvMountCandidate> {
-    let mut candidates = BTreeMap::<PathBuf, String>::new();
+    let mut path_candidates = BTreeMap::<PathBuf, EnvMountCandidate>::new();
+    let mut socket_candidates = BTreeSet::<EnvMountCandidate>::new();
 
     for (key, value) in &env.vars {
         if value.contains("://") {
@@ -40,25 +55,43 @@ pub fn discover_env_mount_candidates(
             };
 
             let kind = metadata.file_type();
-            if !(kind.is_file() || kind.is_dir() || kind.is_socket()) {
+            let Some(kind) = classify_mount_kind(kind) else {
                 continue;
-            }
-
+            };
             if is_forbidden_env_mount(&path, home_dir) {
                 continue;
             }
 
-            candidates.entry(path).or_insert_with(|| var_name.clone());
+            let candidate = EnvMountCandidate {
+                var_name: var_name.clone(),
+                host_path: path.clone(),
+                kind,
+            };
+
+            if kind == EnvMountKind::Socket {
+                socket_candidates.insert(candidate);
+            } else {
+                path_candidates.entry(path).or_insert(candidate);
+            }
         }
     }
 
-    candidates
-        .into_iter()
-        .map(|(host_path, var_name)| EnvMountCandidate {
-            var_name,
-            host_path,
-        })
+    path_candidates
+        .into_values()
+        .chain(socket_candidates)
         .collect()
+}
+
+fn classify_mount_kind(file_type: fs::FileType) -> Option<EnvMountKind> {
+    if file_type.is_file() {
+        Some(EnvMountKind::File)
+    } else if file_type.is_dir() {
+        Some(EnvMountKind::Directory)
+    } else if file_type.is_socket() {
+        Some(EnvMountKind::Socket)
+    } else {
+        None
+    }
 }
 
 fn is_reserved_path_mount(path: &Path) -> bool {
@@ -94,18 +127,32 @@ fn value_segments(value: &str) -> Vec<PathBuf> {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::os::unix::net::UnixListener;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
     use std::path::Path;
 
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
 
     use crate::sandbox::env_filter::ForwardedEnv;
 
-    use super::{discover_env_mount_candidates, is_forbidden_env_mount, EnvMountCandidate};
+    use super::{
+        discover_env_mount_candidates, is_forbidden_env_mount, EnvMountCandidate, EnvMountKind,
+    };
+
+    fn symlink_socket_fixture(path: &Path) -> UnixStream {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let target = format!("/proc/{}/fd/{}", std::process::id(), socket.as_raw_fd());
+        std::os::unix::fs::symlink(target, path).unwrap();
+        socket
+    }
+
+    fn socket_tempdir() -> TempDir {
+        tempdir().unwrap()
+    }
 
     #[test]
     fn discover_candidates_from_absolute_paths_and_path_lists() {
-        let dir = tempdir().unwrap();
+        let dir = socket_tempdir();
         let home = dir.path().join("home");
         let file = dir.path().join("cert.pem");
         let folder = dir.path().join("cache");
@@ -113,7 +160,7 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         fs::write(&file, "ok").unwrap();
         fs::create_dir_all(&folder).unwrap();
-        let _listener = UnixListener::bind(&socket).unwrap();
+        let _socket = symlink_socket_fixture(&socket);
 
         let forwarded = ForwardedEnv {
             vars: BTreeMap::from([
@@ -134,9 +181,15 @@ mod tests {
         let candidates = discover_env_mount_candidates(&forwarded, &home);
 
         assert_eq!(candidates.len(), 3);
-        assert!(candidates.iter().any(|item| item.host_path == file));
-        assert!(candidates.iter().any(|item| item.host_path == folder));
-        assert!(candidates.iter().any(|item| item.host_path == socket));
+        assert!(candidates
+            .iter()
+            .any(|item| item.host_path == file && item.kind == EnvMountKind::File));
+        assert!(candidates
+            .iter()
+            .any(|item| item.host_path == folder && item.kind == EnvMountKind::Directory));
+        assert!(candidates
+            .iter()
+            .any(|item| item.host_path == socket && item.kind == EnvMountKind::Socket));
         assert!(!candidates.iter().any(|item| item.host_path == home));
         assert!(!candidates
             .iter()
@@ -151,7 +204,7 @@ mod tests {
 
     #[test]
     fn discover_candidates_ignores_url_like_values() {
-        let dir = tempdir().unwrap();
+        let dir = socket_tempdir();
         let home = dir.path().join("home");
         fs::create_dir_all(&home).unwrap();
 
@@ -190,7 +243,43 @@ mod tests {
             vec![EnvMountCandidate {
                 var_name: "SSH_AUTH_SOCK".into(),
                 host_path: link,
+                kind: EnvMountKind::File,
             }]
+        );
+    }
+
+    #[test]
+    fn discover_candidates_keeps_socket_candidates_per_env_var() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let socket = dir.path().join("agent.sock");
+        fs::create_dir_all(&home).unwrap();
+        let _socket = symlink_socket_fixture(&socket);
+
+        let forwarded = ForwardedEnv {
+            vars: BTreeMap::from([
+                ("A_SOCK".into(), socket.to_string_lossy().into_owned()),
+                ("B_SOCK".into(), socket.to_string_lossy().into_owned()),
+            ]),
+            path_prefix: None,
+        };
+
+        let candidates = discover_env_mount_candidates(&forwarded, &home);
+
+        assert_eq!(
+            candidates,
+            vec![
+                EnvMountCandidate {
+                    var_name: "A_SOCK".into(),
+                    host_path: socket.clone(),
+                    kind: EnvMountKind::Socket,
+                },
+                EnvMountCandidate {
+                    var_name: "B_SOCK".into(),
+                    host_path: socket,
+                    kind: EnvMountKind::Socket,
+                },
+            ]
         );
     }
 
@@ -216,6 +305,7 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].host_path, allowed);
         assert_eq!(candidates[0].var_name, "ALLOWED");
+        assert_eq!(candidates[0].kind, EnvMountKind::File);
     }
 
     #[test]

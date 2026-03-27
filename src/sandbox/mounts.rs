@@ -8,6 +8,8 @@ use crate::user_context::UserContext;
 
 pub const GUEST_PODMAN_ROOT: &str = "/var/lib/containers";
 pub const GUEST_ADDITIONAL_IMAGE_STORE: &str = "/var/lib/shared";
+pub const GUEST_SSH_KNOWN_HOSTS_SEED: &str = "/tmp/codexbox-host-ssh-known_hosts";
+const HOST_DOCKER_CONFIG_DIR: &str = "/etc/docker";
 const CA_TRUST_PATHS: &[&str] = &[
     "/etc/ssl/certs",
     "/etc/pki/tls/certs",
@@ -76,6 +78,14 @@ pub fn base_mounts(user: &UserContext, writable_roots: &[PathBuf]) -> Result<Vec
         }
     }
 
+    mounts.extend(existing_readonly_self_mounts(&[PathBuf::from(
+        HOST_DOCKER_CONFIG_DIR,
+    )]));
+
+    if let Some(mount) = ssh_known_hosts_mount(user) {
+        mounts.push(mount);
+    }
+
     for root in writable_roots {
         mounts.push(MountSpec {
             host: root.clone(),
@@ -87,6 +97,12 @@ pub fn base_mounts(user: &UserContext, writable_roots: &[PathBuf]) -> Result<Vec
 
     mounts.extend(podman_persistence_mounts(user)?);
     Ok(dedupe_mounts(mounts))
+}
+
+pub fn has_ssh_known_hosts_mount(mounts: &[MountSpec]) -> bool {
+    mounts
+        .iter()
+        .any(|mount| mount.guest == Path::new(GUEST_SSH_KNOWN_HOSTS_SEED))
 }
 
 pub fn prepare_runtime_dirs(user: &UserContext) -> Result<()> {
@@ -210,6 +226,33 @@ fn podman_persistence_mounts(user: &UserContext) -> Result<Vec<MountSpec>> {
     Ok(mounts)
 }
 
+fn existing_readonly_self_mounts(paths: &[PathBuf]) -> Vec<MountSpec> {
+    paths
+        .iter()
+        .filter(|path| path.exists())
+        .map(|path| MountSpec {
+            host: path.clone(),
+            guest: path.clone(),
+            mode: MountMode::ReadOnly,
+            source: MountSource::Fixed,
+        })
+        .collect()
+}
+
+fn ssh_known_hosts_mount(user: &UserContext) -> Option<MountSpec> {
+    let host_path = user.home_dir.join(".ssh").join("known_hosts");
+    if !host_path.exists() {
+        return None;
+    }
+
+    Some(MountSpec {
+        host: host_path,
+        guest: PathBuf::from(GUEST_SSH_KNOWN_HOSTS_SEED),
+        mode: MountMode::ReadOnly,
+        source: MountSource::Fixed,
+    })
+}
+
 fn ensure_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path).map_err(|source| CodexboxError::WritePath {
         path: path.to_path_buf(),
@@ -241,12 +284,14 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::sandbox::env_mounts::EnvMountCandidate;
+    use crate::sandbox::env_mounts::{EnvMountCandidate, EnvMountKind};
     use crate::user_context::UserContext;
 
     use super::{
-        base_mounts, discover_ca_trust_paths, filter_covered_env_candidates, prepare_runtime_dirs,
-        MountMode, GUEST_ADDITIONAL_IMAGE_STORE, GUEST_PODMAN_ROOT,
+        base_mounts, discover_ca_trust_paths, existing_readonly_self_mounts,
+        filter_covered_env_candidates, has_ssh_known_hosts_mount, prepare_runtime_dirs, MountMode,
+        GUEST_ADDITIONAL_IMAGE_STORE, GUEST_PODMAN_ROOT, GUEST_SSH_KNOWN_HOSTS_SEED,
+        HOST_DOCKER_CONFIG_DIR,
     };
 
     #[test]
@@ -270,6 +315,7 @@ mod tests {
         let candidates = vec![EnvMountCandidate {
             var_name: "DIRENV_DIR".into(),
             host_path: nested,
+            kind: EnvMountKind::Directory,
         }];
 
         let filtered = filter_covered_env_candidates(candidates, &mounts);
@@ -313,6 +359,36 @@ mod tests {
     }
 
     #[test]
+    fn base_mounts_include_host_docker_config_readonly_when_present() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("workspace");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+
+        let mounts = base_mounts(
+            &UserContext {
+                uid: 1000,
+                gid: 1000,
+                home_dir: home,
+                cwd,
+            },
+            &[],
+        )
+        .unwrap();
+
+        let docker_config = Path::new(HOST_DOCKER_CONFIG_DIR);
+        assert_eq!(
+            mounts.iter().any(|mount| {
+                mount.host == docker_config
+                    && mount.guest == docker_config
+                    && mount.mode == MountMode::ReadOnly
+            }),
+            docker_config.exists()
+        );
+    }
+
+    #[test]
     fn prepare_runtime_dirs_creates_only_runtime_state() {
         let dir = tempdir().unwrap();
         let home = dir.path().join("home");
@@ -333,6 +409,35 @@ mod tests {
     }
 
     #[test]
+    fn base_mounts_seed_ssh_known_hosts_readonly_when_present() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("workspace");
+        let known_hosts = home.join(".ssh/known_hosts");
+        fs::create_dir_all(known_hosts.parent().unwrap()).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(&known_hosts, "github.com ssh-ed25519 AAAA").unwrap();
+
+        let mounts = base_mounts(
+            &UserContext {
+                uid: 1000,
+                gid: 1000,
+                home_dir: home,
+                cwd,
+            },
+            &[],
+        )
+        .unwrap();
+
+        assert!(has_ssh_known_hosts_mount(&mounts));
+        assert!(mounts.iter().any(|mount| {
+            mount.host == known_hosts
+                && mount.guest == Path::new(GUEST_SSH_KNOWN_HOSTS_SEED)
+                && mount.mode == MountMode::ReadOnly
+        }));
+    }
+
+    #[test]
     fn discover_ca_trust_paths_are_existing_and_unique() {
         let paths = discover_ca_trust_paths();
 
@@ -344,5 +449,20 @@ mod tests {
         unique.sort();
         unique.dedup();
         assert_eq!(paths, unique);
+    }
+
+    #[test]
+    fn existing_readonly_self_mounts_skip_missing_paths() {
+        let dir = tempdir().unwrap();
+        let present = dir.path().join("docker");
+        let missing = dir.path().join("missing");
+        fs::create_dir_all(&present).unwrap();
+
+        let mounts = existing_readonly_self_mounts(&[present.clone(), missing]);
+
+        assert_eq!(mounts.len(), 1);
+        assert!(mounts.iter().any(|mount| {
+            mount.host == present && mount.guest == present && mount.mode == MountMode::ReadOnly
+        }));
     }
 }

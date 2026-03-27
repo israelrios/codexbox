@@ -71,7 +71,7 @@ fn is_reserved_path_segment(segment: &str) -> bool {
     matches!(segment, "/bin" | "/sbin") || segment == "/usr" || segment.starts_with("/usr/")
 }
 
-fn build_matcher(patterns: &[String]) -> Result<GlobSet> {
+pub(crate) fn build_matcher(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
 
     for pattern in patterns {
@@ -141,6 +141,20 @@ mod tests {
             Some(&"/tmp/ssh.sock".to_string())
         );
         assert!(!forwarded.vars.contains_key("SSH_AGENT_PID"));
+    }
+
+    #[test]
+    fn filter_environment_keeps_ssh_auth_sock_without_explicit_override() {
+        let forwarded = filter_environment_from_iter(
+            [("SSH_AUTH_SOCK", "/tmp/ssh.sock")],
+            &EnvFilterConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            forwarded.vars.get("SSH_AUTH_SOCK"),
+            Some(&"/tmp/ssh.sock".to_string())
+        );
     }
 
     #[test]

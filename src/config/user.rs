@@ -11,7 +11,7 @@ use tempfile::NamedTempFile;
 
 use crate::errors::{CodexboxError, Result};
 use crate::path_utils::{canonicalize_if_possible, resolve_from_home};
-use crate::sandbox::env_filter::EnvFilterConfig;
+use crate::sandbox::env_filter::{build_matcher, EnvFilterConfig};
 use crate::user_context::UserContext;
 
 const DEFAULT_BLOCKED_VAR_PATTERNS: &[&str] = &[
@@ -84,6 +84,8 @@ pub struct UserConfig {
     #[serde(default)]
     pub approved_paths: BTreeSet<PathBuf>,
     #[serde(default)]
+    pub approved_socket_vars: BTreeSet<String>,
+    #[serde(default)]
     pub publish: Vec<PublishSpec>,
     #[serde(default)]
     pub add_dirs: Vec<PathBuf>,
@@ -106,6 +108,7 @@ pub struct DirectoryRule {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EffectiveUserConfig {
     pub approved_paths: BTreeSet<PathBuf>,
+    pub approved_socket_vars: BTreeSet<String>,
     pub publish: Vec<PublishSpec>,
     pub add_dirs: Vec<PathBuf>,
 }
@@ -234,6 +237,7 @@ impl UserConfig {
         let cwd = canonicalize_if_possible(cwd);
         let mut effective = EffectiveUserConfig {
             approved_paths: self.approved_paths.clone(),
+            approved_socket_vars: self.approved_socket_vars.clone(),
             publish: self.publish.clone(),
             add_dirs: self.add_dirs.clone(),
         };
@@ -266,7 +270,7 @@ pub fn load_launcher_config(user: &UserContext) -> Result<LauncherConfig> {
     let effective_config = user_config.effective_for(&user.cwd, &user.home_dir);
     let mut blocked_patterns = default_blocked_var_patterns();
     merge_unique(&mut blocked_patterns, &user_config.block_var_patterns);
-    let mut allowed_patterns = Vec::new();
+    let mut allowed_patterns = default_allowed_var_patterns(&user_config)?;
     merge_unique(&mut allowed_patterns, &user_config.allow_var_patterns);
 
     Ok(LauncherConfig {
@@ -383,6 +387,19 @@ fn default_blocked_var_patterns() -> Vec<String> {
         .collect()
 }
 
+fn default_allowed_var_patterns(user_config: &UserConfig) -> Result<Vec<String>> {
+    let mut patterns = Vec::new();
+    if !patterns_match_var(&user_config.block_var_patterns, "SSH_AUTH_SOCK")? {
+        patterns.push("SSH_AUTH_SOCK".to_string());
+    }
+
+    Ok(patterns)
+}
+
+fn patterns_match_var(patterns: &[String], var_name: &str) -> Result<bool> {
+    Ok(build_matcher(patterns)?.is_match(var_name))
+}
+
 fn merge_unique<T: Eq + Clone>(target: &mut Vec<T>, entries: &[T]) {
     for entry in entries {
         if !target.contains(entry) {
@@ -491,6 +508,7 @@ mod tests {
                 PathBuf::from("/run/user/1000/podman.sock"),
                 PathBuf::from("/tmp/cache"),
             ]),
+            approved_socket_vars: BTreeSet::from(["SSH_AUTH_SOCK".to_string()]),
             publish: vec![publish("127.0.0.1:8080:80"), publish("8443:443")],
             add_dirs: vec![PathBuf::from("~/shared"), PathBuf::from("/tmp/cache")],
             block_var_patterns: vec!["CUSTOM_*".into()],
@@ -507,6 +525,7 @@ mod tests {
         let loaded = load_user_config(&path).unwrap();
 
         assert!(saved.contains("\"approved_paths\""));
+        assert!(saved.contains("\"approved_socket_vars\""));
         assert!(saved.contains("\"block_var_patterns\""));
         assert!(saved.contains("\"allow_var_patterns\""));
         assert!(saved.contains("\"directory_rules\""));
@@ -523,6 +542,7 @@ mod tests {
 
         let config = UserConfig {
             approved_paths: BTreeSet::from([PathBuf::from("/tmp/global.sock")]),
+            approved_socket_vars: BTreeSet::from(["SSH_AUTH_SOCK".to_string()]),
             publish: vec![publish("127.0.0.1:8080:80")],
             add_dirs: vec![PathBuf::from("~/shared")],
             block_var_patterns: Vec::new(),
@@ -547,6 +567,7 @@ mod tests {
             effective,
             EffectiveUserConfig {
                 approved_paths: BTreeSet::from([PathBuf::from("/tmp/global.sock")]),
+                approved_socket_vars: BTreeSet::from(["SSH_AUTH_SOCK".to_string()]),
                 publish: vec![
                     publish("127.0.0.1:8080:80"),
                     publish("3000:3000"),
@@ -607,5 +628,54 @@ mod tests {
             config.env_filter.allowed_patterns,
             vec!["SSH_AUTH_SOCK".to_string()]
         );
+    }
+
+    #[test]
+    fn launcher_config_allows_ssh_auth_sock_by_default() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("workspace");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+
+        let config = load_launcher_config(&UserContext {
+            uid: 1000,
+            gid: 1000,
+            home_dir: home,
+            cwd,
+        })
+        .unwrap();
+
+        assert_eq!(
+            config.env_filter.allowed_patterns,
+            vec!["SSH_AUTH_SOCK".to_string()]
+        );
+    }
+
+    #[test]
+    fn launcher_config_respects_explicit_ssh_auth_sock_block() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("workspace");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(
+            home.join(".codexbox-conf.json"),
+            r#"{
+  "block_var_patterns": ["SSH_AUTH_SOCK"]
+}
+"#,
+        )
+        .unwrap();
+
+        let config = load_launcher_config(&UserContext {
+            uid: 1000,
+            gid: 1000,
+            home_dir: home,
+            cwd,
+        })
+        .unwrap();
+
+        assert!(config.env_filter.allowed_patterns.is_empty());
     }
 }

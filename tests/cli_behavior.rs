@@ -1,11 +1,13 @@
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use codexbox::podman::embedded_image_fingerprint;
+use codexbox::sandbox::mounts::GUEST_SSH_KNOWN_HOSTS_SEED;
 use tempfile::tempdir;
 
 fn codexbox_bin() -> &'static str {
@@ -54,6 +56,10 @@ log_file="${CODEXBOX_TEST_PODMAN_LOG:?}"
     printf '\n'
 } >> "$log_file"
 
+if [ "$1" = "--cgroup-manager" ]; then
+    shift 2
+fi
+
 if [ "$1" = "image" ] && [ "$2" = "exists" ]; then
     exit 0
 fi
@@ -88,6 +94,13 @@ exit 0
     let mut permissions = fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).unwrap();
+}
+
+fn symlink_socket_fixture(path: &Path) -> UnixStream {
+    let (socket, _peer) = UnixStream::pair().unwrap();
+    let target = format!("/proc/{}/fd/{}", std::process::id(), socket.as_raw_fd());
+    std::os::unix::fs::symlink(target, path).unwrap();
+    socket
 }
 
 #[test]
@@ -216,25 +229,22 @@ fn dry_run_filters_internal_env_and_url_mount_detection() {
 }
 
 #[test]
-fn allow_var_patterns_can_forward_approved_ssh_socket() {
+fn allow_var_patterns_can_reallow_explicitly_blocked_ssh_socket() {
     let dir = tempdir().unwrap();
     let home_dir = dir.path().join("home");
     let workspace = dir.path().join("workspace");
     let ssh_socket = dir.path().join("agent.sock");
     fs::create_dir_all(&home_dir).unwrap();
     fs::create_dir_all(&workspace).unwrap();
-    let _listener = UnixListener::bind(&ssh_socket).unwrap();
+    let _socket = symlink_socket_fixture(&ssh_socket);
 
     fs::write(
         home_dir.join(".codexbox-conf.json"),
-        format!(
-            r#"{{
-  "approved_paths": ["{}"],
+        r#"{
+  "approved_socket_vars": ["SSH_AUTH_SOCK"],
   "block_var_patterns": ["SSH*"],
   "allow_var_patterns": ["SSH_AUTH_SOCK"]
-}}"#,
-            ssh_socket.display()
-        ),
+}"#,
     )
     .unwrap();
 
@@ -252,6 +262,66 @@ fn allow_var_patterns_can_forward_approved_ssh_socket() {
         "src={},target={},ro",
         ssh_socket.display(),
         ssh_socket.display()
+    )));
+}
+
+#[test]
+fn dry_run_seeds_host_ssh_known_hosts_via_readonly_mount() {
+    let dir = tempdir().unwrap();
+    let home_dir = dir.path().join("home");
+    let workspace = dir.path().join("workspace");
+    let known_hosts = home_dir.join(".ssh/known_hosts");
+    fs::create_dir_all(known_hosts.parent().unwrap()).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(&known_hosts, "github.com ssh-ed25519 AAAA").unwrap();
+
+    let output = run_codexbox(&home_dir, &workspace, &["--dry-run"], &[]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert!(stdout.contains(&format!(
+        "src={},target={},ro",
+        known_hosts.display(),
+        GUEST_SSH_KNOWN_HOSTS_SEED
+    )));
+    assert!(stdout.contains(&format!(
+        "--env CODEXBOX_SSH_KNOWN_HOSTS_SEED={}",
+        GUEST_SSH_KNOWN_HOSTS_SEED
+    )));
+}
+
+#[test]
+fn dry_run_overlays_known_hosts_when_home_is_writable() {
+    let dir = tempdir().unwrap();
+    let home_dir = dir.path().join("home");
+    let workspace = dir.path().join("workspace");
+    let known_hosts = home_dir.join(".ssh/known_hosts");
+    fs::create_dir_all(known_hosts.parent().unwrap()).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(home_dir.join(".codex")).unwrap();
+    fs::write(&known_hosts, "github.com ssh-ed25519 AAAA").unwrap();
+    fs::write(
+        home_dir.join(".codex/config.toml"),
+        format!(
+            "[sandbox_workspace_write]\nwritable_roots = [\"{}\"]\n",
+            home_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let output = run_codexbox(&home_dir, &workspace, &["--dry-run"], &[]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert!(stdout.contains(&format!("target={}", known_hosts.display())));
+    assert!(!stdout.contains(&format!(
+        "src={},target={},ro",
+        known_hosts.display(),
+        GUEST_SSH_KNOWN_HOSTS_SEED
+    )));
+    assert!(!stdout.contains(&format!(
+        "--env CODEXBOX_SSH_KNOWN_HOSTS_SEED={}",
+        GUEST_SSH_KNOWN_HOSTS_SEED
     )));
 }
 
@@ -329,8 +399,8 @@ fn stale_image_triggers_rebuild() {
 
     assert!(output.status.success());
     assert!(log.contains("ARGS:[image][inspect]"));
-    assert!(log.contains("ARGS:[build]"));
-    assert!(log.contains("[--isolation][chroot]"));
+    assert!(log.contains("ARGS:[--cgroup-manager][cgroupfs][build]"));
+    assert!(!log.contains("[--isolation][chroot]"));
 }
 
 #[test]
@@ -371,7 +441,7 @@ fn rebuild_keeps_podman_build_stdout_out_of_command_stdout() {
     assert!(output.status.success());
     assert_eq!(stdout, "smoke");
     assert!(stderr.contains("build noise"));
-    assert!(log.contains("ARGS:[build]"));
+    assert!(log.contains("ARGS:[--cgroup-manager][cgroupfs][build]"));
     assert!(log.contains("ARGS:[run]"));
 }
 

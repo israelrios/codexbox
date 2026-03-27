@@ -47,16 +47,18 @@ impl ApprovalPrompt for StdioApprovalPrompt {
 pub fn approved_candidates(
     candidates: Vec<EnvMountCandidate>,
     approved_paths: &BTreeSet<PathBuf>,
+    approved_socket_vars: &BTreeSet<String>,
 ) -> Vec<EnvMountCandidate> {
     candidates
         .into_iter()
-        .filter(|candidate| approved_paths.contains(&candidate.host_path))
+        .filter(|candidate| candidate_is_approved(candidate, approved_paths, approved_socket_vars))
         .collect()
 }
 
 pub fn approve_candidates<P: ApprovalPrompt>(
     candidates: Vec<EnvMountCandidate>,
     approved_paths: &BTreeSet<PathBuf>,
+    approved_socket_vars: &BTreeSet<String>,
     user_config: &mut UserConfig,
     config_path: &Path,
     prompt: &mut P,
@@ -65,17 +67,24 @@ pub fn approve_candidates<P: ApprovalPrompt>(
     let mut changed = false;
 
     for candidate in candidates {
-        if approved_paths.contains(&candidate.host_path) {
+        if candidate.is_socket()
+            && !approved_socket_vars.contains(&candidate.var_name)
+            && approved_paths.contains(&candidate.host_path)
+        {
+            changed |= user_config
+                .approved_socket_vars
+                .insert(candidate.var_name.clone());
+            approved.push(candidate);
+            continue;
+        }
+        if candidate_is_approved(&candidate, approved_paths, approved_socket_vars) {
             approved.push(candidate);
             continue;
         }
 
         if prompt.confirm(&candidate)? {
-            user_config
-                .approved_paths
-                .insert(candidate.host_path.clone());
+            changed |= persist_candidate_approval(&candidate, user_config);
             approved.push(candidate);
-            changed = true;
         }
     }
 
@@ -84,6 +93,31 @@ pub fn approve_candidates<P: ApprovalPrompt>(
     }
 
     Ok(approved)
+}
+
+fn candidate_is_approved(
+    candidate: &EnvMountCandidate,
+    approved_paths: &BTreeSet<PathBuf>,
+    approved_socket_vars: &BTreeSet<String>,
+) -> bool {
+    if candidate.is_socket() {
+        approved_socket_vars.contains(&candidate.var_name)
+            || approved_paths.contains(&candidate.host_path)
+    } else {
+        approved_paths.contains(&candidate.host_path)
+    }
+}
+
+fn persist_candidate_approval(candidate: &EnvMountCandidate, user_config: &mut UserConfig) -> bool {
+    if candidate.is_socket() {
+        user_config
+            .approved_socket_vars
+            .insert(candidate.var_name.clone())
+    } else {
+        user_config
+            .approved_paths
+            .insert(candidate.host_path.clone())
+    }
 }
 
 #[cfg(test)]
@@ -96,7 +130,7 @@ mod tests {
 
     use super::{approve_candidates, approved_candidates, ApprovalPrompt};
     use crate::config::user::{load_user_config, UserConfig};
-    use crate::sandbox::env_mounts::EnvMountCandidate;
+    use crate::sandbox::env_mounts::{EnvMountCandidate, EnvMountKind};
 
     struct FixedPrompt {
         answers: RefCell<Vec<bool>>,
@@ -115,6 +149,7 @@ mod tests {
         let candidate = EnvMountCandidate {
             var_name: "SSH_AUTH_SOCK".into(),
             host_path: dir.path().join("sock"),
+            kind: EnvMountKind::Socket,
         };
         let mut user_config = UserConfig::default();
 
@@ -125,6 +160,7 @@ mod tests {
         let approved = approve_candidates(
             vec![candidate.clone()],
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &mut user_config,
             &config_path,
             &mut prompt,
@@ -133,7 +169,7 @@ mod tests {
         let saved = load_user_config(&config_path).unwrap();
 
         assert_eq!(approved, vec![candidate.clone()]);
-        assert!(saved.approved_paths.contains(&candidate.host_path));
+        assert!(saved.approved_socket_vars.contains(&candidate.var_name));
     }
 
     #[test]
@@ -143,13 +179,16 @@ mod tests {
                 EnvMountCandidate {
                     var_name: "A".into(),
                     host_path: PathBuf::from("/tmp/a"),
+                    kind: EnvMountKind::File,
                 },
                 EnvMountCandidate {
                     var_name: "B".into(),
                     host_path: PathBuf::from("/tmp/b"),
+                    kind: EnvMountKind::File,
                 },
             ],
             &BTreeSet::from([PathBuf::from("/tmp/b")]),
+            &BTreeSet::new(),
         );
 
         assert_eq!(
@@ -157,7 +196,57 @@ mod tests {
             vec![EnvMountCandidate {
                 var_name: "B".into(),
                 host_path: PathBuf::from("/tmp/b"),
+                kind: EnvMountKind::File,
             }]
         );
+    }
+
+    #[test]
+    fn approved_candidates_accept_socket_by_var_name() {
+        let approved = approved_candidates(
+            vec![EnvMountCandidate {
+                var_name: "SSH_AUTH_SOCK".into(),
+                host_path: PathBuf::from("/tmp/rotated.sock"),
+                kind: EnvMountKind::Socket,
+            }],
+            &BTreeSet::new(),
+            &BTreeSet::from(["SSH_AUTH_SOCK".to_string()]),
+        );
+
+        assert_eq!(approved.len(), 1);
+    }
+
+    #[test]
+    fn approve_candidates_migrates_legacy_socket_path_approval() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("codexbox-conf.json");
+        let host_path = dir.path().join("sock");
+        let candidate = EnvMountCandidate {
+            var_name: "SSH_AUTH_SOCK".into(),
+            host_path: host_path.clone(),
+            kind: EnvMountKind::Socket,
+        };
+        let mut user_config = UserConfig {
+            approved_paths: BTreeSet::from([host_path]),
+            ..UserConfig::default()
+        };
+        let approved_paths = user_config.approved_paths.clone();
+        let mut prompt = FixedPrompt {
+            answers: RefCell::new(vec![]),
+        };
+
+        let approved = approve_candidates(
+            vec![candidate.clone()],
+            &approved_paths,
+            &BTreeSet::new(),
+            &mut user_config,
+            &config_path,
+            &mut prompt,
+        )
+        .unwrap();
+        let saved = load_user_config(&config_path).unwrap();
+
+        assert_eq!(approved, vec![candidate]);
+        assert!(saved.approved_socket_vars.contains("SSH_AUTH_SOCK"));
     }
 }

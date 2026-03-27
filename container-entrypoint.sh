@@ -13,6 +13,16 @@ if [ "${CODEXBOX_PATH_PREFIX+x}" = x ]; then
     export PATH="${CODEXBOX_PATH_PREFIX}:$PATH"
 fi
 
+if [ "${CODEXBOX_SSH_KNOWN_HOSTS_SEED:-}" != "" ] && [ -f "$CODEXBOX_SSH_KNOWN_HOSTS_SEED" ]; then
+    ssh_dir="${HOME:-/root}/.ssh"
+    known_hosts_path="$ssh_dir/known_hosts"
+    mkdir -p "$ssh_dir"
+    chmod 700 "$ssh_dir" 2>/dev/null || true
+    if [ ! -e "$known_hosts_path" ]; then
+        cp "$CODEXBOX_SSH_KNOWN_HOSTS_SEED" "$known_hosts_path"
+    fi
+fi
+
 if [ "${HOME:-}" != "" ] && [ "$HOME" != "/root" ]; then
     home_config_dir="$HOME/.config"
     home_containers_dir="$home_config_dir/containers"

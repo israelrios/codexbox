@@ -1,8 +1,8 @@
 use std::fs;
-#[cfg(unix)]
-use std::os::fd::BorrowedFd;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
@@ -85,12 +85,10 @@ pub fn ensure_image(image: &str, rebuild: bool) -> Result<()> {
 fn build_image(image: &str, fingerprint: &str) -> Result<()> {
     let context = EmbeddedBuildContext::create()?;
     let built_at = current_unix_timestamp()?;
-    let progress_output = stderr_stdio().map_err(CodexboxError::PodmanSpawn)?;
-
-    let status = Command::new("podman")
+    let mut command = Command::new("podman");
+    configure_host_podman_command(&mut command);
+    command
         .arg("build")
-        .arg("--isolation")
-        .arg("chroot")
         .arg("--tag")
         .arg(image)
         .arg("--label")
@@ -99,11 +97,10 @@ fn build_image(image: &str, fingerprint: &str) -> Result<()> {
         .arg(format!("{IMAGE_BUILT_AT_LABEL}={built_at}"))
         .arg("--file")
         .arg(context.containerfile_path())
-        .arg(context.path())
-        .stdout(progress_output)
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(CodexboxError::PodmanSpawn)?;
+        .arg(context.path());
+
+    let status =
+        run_with_stdout_forwarded_to_stderr(&mut command).map_err(CodexboxError::PodmanSpawn)?;
 
     if status.success() {
         Ok(())
@@ -180,18 +177,33 @@ fn current_unix_timestamp() -> Result<u64> {
         })
 }
 
-fn stderr_stdio() -> std::io::Result<Stdio> {
-    #[cfg(unix)]
-    {
-        // SAFETY: file descriptor 2 is the process stderr stream for the lifetime of the process.
-        let stderr = unsafe { BorrowedFd::borrow_raw(2) };
-        stderr.try_clone_to_owned().map(Stdio::from)
-    }
+fn configure_host_podman_command(command: &mut Command) {
+    command.arg("--cgroup-manager").arg("cgroupfs");
+}
 
-    #[cfg(not(unix))]
-    {
-        Ok(Stdio::inherit())
-    }
+fn run_with_stdout_forwarded_to_stderr(command: &mut Command) -> io::Result<ExitStatus> {
+    command.stdout(Stdio::piped()).stderr(Stdio::inherit());
+
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("failed to capture podman stdout"))?;
+    let forwarder = thread::spawn(move || -> io::Result<()> {
+        let mut reader = stdout;
+        let mut stderr = io::stderr().lock();
+        io::copy(&mut reader, &mut stderr)?;
+        stderr.flush()
+    });
+
+    let wait_result = child.wait();
+    let forward_result = forwarder
+        .join()
+        .map_err(|_| io::Error::other("stdout forwarding thread panicked"))?;
+    let status = wait_result?;
+    forward_result?;
+
+    Ok(status)
 }
 
 fn write_embedded_asset(path: PathBuf, contents: &[u8]) -> Result<()> {
@@ -254,14 +266,11 @@ pub fn import_exported_images(export_dir: &Path) -> Result<()> {
     archives.sort();
 
     for archive in archives {
-        let progress_output = stderr_stdio().map_err(CodexboxError::PodmanSpawn)?;
-        let status = Command::new("podman")
-            .arg("load")
-            .arg("--input")
-            .arg(&archive)
-            .stdout(progress_output)
-            .stderr(Stdio::inherit())
-            .status()
+        let mut command = Command::new("podman");
+        configure_host_podman_command(&mut command);
+        command.arg("load").arg("--input").arg(&archive);
+
+        let status = run_with_stdout_forwarded_to_stderr(&mut command)
             .map_err(CodexboxError::PodmanSpawn)?;
         if !status.success() {
             return Err(CodexboxError::PodmanLoadFailed {
@@ -277,9 +286,10 @@ pub fn import_exported_images(export_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        image_metadata_format, parse_image_metadata, ImageMetadata, IMAGE_BUILT_AT_LABEL,
-        IMAGE_FINGERPRINT_LABEL,
+        configure_host_podman_command, image_metadata_format, parse_image_metadata, ImageMetadata,
+        IMAGE_BUILT_AT_LABEL, IMAGE_FINGERPRINT_LABEL,
     };
+    use std::process::Command;
 
     #[test]
     fn image_metadata_format_reads_both_labels() {
@@ -302,5 +312,19 @@ mod tests {
         );
         assert!(parse_image_metadata(b"fingerprint|").is_none());
         assert!(parse_image_metadata(b"|123").is_none());
+    }
+
+    #[test]
+    fn host_build_command_uses_cgroupfs_manager() {
+        let mut command = Command::new("podman");
+        configure_host_podman_command(&mut command);
+
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["--cgroup-manager".to_string(), "cgroupfs".to_string()]
+        );
     }
 }

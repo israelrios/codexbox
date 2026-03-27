@@ -64,13 +64,14 @@ Schema:
 
 ```json
 {
-  "approved_paths": ["/run/user/1000/podman/podman.sock"],
+  "approved_paths": ["/tmp/cache", "/etc/ssl/certs/custom.pem"],
+  "approved_socket_vars": ["SSH_AUTH_SOCK"],
   "publish": [
     { "host_ip": "127.0.0.1", "host_port": 8080, "container_port": 80 }
   ],
   "add_dirs": ["~/shared"],
   "block_var_patterns": ["MY_SECRET_*"],
-  "allow_var_patterns": ["SSH_AUTH_SOCK"],
+  "allow_var_patterns": ["MY_SECRET_PUBLIC_*"],
   "directory_rules": [
     {
       "path": "~/work/project",
@@ -83,7 +84,8 @@ Schema:
 
 Rules:
 
-- `approved_paths` stores globally approved read-only env-derived mounts
+- `approved_paths` stores globally approved read-only env-derived file and directory mounts
+- `approved_socket_vars` stores globally approved env var names for Unix socket mounts
 - `publish` adds validated port mappings
 - `add_dirs` adds extra writable directory mounts and matching `codex --add-dir` arguments
 - `block_var_patterns` extends the built-in environment block list
@@ -144,6 +146,8 @@ The launcher must mount these read-only when present:
 - `~/.gitconfig`
 - `~/.config/gh`
 - `~/.config/glab-cli`
+- `/etc/docker`
+- `~/.ssh/known_hosts` as a seed file for an ephemeral in-container copy
 - approved env-derived paths
 - discovered host CA trust paths
 
@@ -161,6 +165,7 @@ Rules:
 - do not forward any variable whose key matches the effective block list unless it also matches an allow pattern
 - explicitly preserve the invoking `PATH`
 - never forward internal `CODEXBOX_*` control variables
+- forward `SSH_AUTH_SOCK` by default so an approved SSH agent socket can be mounted into the sandbox
 
 ## 8. Env-derived mount discovery
 
@@ -180,11 +185,13 @@ Policy rules:
 - the user home directory root itself must never be added through env-derived discovery
 - subpaths under the home directory may be approved
 - a candidate already covered by another mount should be ignored
+- socket candidates are keyed by env var name so rotating socket paths can be re-mounted without re-approval
 
 Approval rules:
 
 - new env-derived candidates require interactive one-time approval
-- approved paths are persisted to `approved_paths`
+- approved file and directory paths are persisted to `approved_paths`
+- approved socket env var names are persisted to `approved_socket_vars`
 - denied paths are not persisted
 - `--dry-run` uses only already-approved paths and must not prompt
 
@@ -242,7 +249,8 @@ The implementation is correct only if all of the following hold:
 - the binary works without repo-local config files or bundled runtime sidecar files
 - `~/.codexbox-conf.json` is the only persisted `codexbox` config file
 - per-directory config affects only `publish` and `add_dirs`
-- env-derived approvals are stored globally in `approved_paths`
+- env-derived file and directory approvals are stored globally in `approved_paths`
+- env-derived socket approvals are stored globally in `approved_socket_vars`
 - `--dry-run` is side-effect free
 - env-derived discovery ignores URL-like values containing `://`
 - the sandbox image is rebuilt only when necessary, when older than 7 days, or explicitly requested

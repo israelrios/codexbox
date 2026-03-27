@@ -1,6 +1,7 @@
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -15,6 +16,13 @@ fn write_fake_podman(path: &Path, script: &str) {
     let mut permissions = fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).unwrap();
+}
+
+fn symlink_socket_fixture(path: &Path) -> UnixStream {
+    let (socket, _peer) = UnixStream::pair().unwrap();
+    let target = format!("/proc/{}/fd/{}", std::process::id(), socket.as_raw_fd());
+    std::os::unix::fs::symlink(target, path).unwrap();
+    socket
 }
 
 #[test]
@@ -69,7 +77,7 @@ fn entrypoint_exports_new_images_after_command_finishes() {
     fs::create_dir_all(&fake_bin).unwrap();
     fs::create_dir_all(&home_dir).unwrap();
     fs::create_dir_all(&socket_dir).unwrap();
-    let _socket = UnixListener::bind(socket_dir.join("podman.sock")).unwrap();
+    let _socket = symlink_socket_fixture(&socket_dir.join("podman.sock"));
 
     write_fake_podman(
         &fake_bin.join("podman"),
@@ -143,6 +151,56 @@ exit 0
 }
 
 #[test]
+fn entrypoint_seeds_home_known_hosts_and_keeps_session_edits_ephemeral() {
+    let dir = tempdir().unwrap();
+    let fake_bin = dir.path().join("fake-bin");
+    let home_dir = dir.path().join("home");
+    let runtime_dir = dir.path().join("runtime");
+    let socket_dir = runtime_dir.join("podman");
+    let seed_dir = dir.path().join("seed");
+    let seed_path = seed_dir.join("known_hosts");
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+    fs::create_dir_all(&socket_dir).unwrap();
+    fs::create_dir_all(&seed_dir).unwrap();
+    fs::write(&seed_path, "github.com ssh-ed25519 AAAA\n").unwrap();
+    let _socket = symlink_socket_fixture(&socket_dir.join("podman.sock"));
+
+    write_fake_podman(
+        &fake_bin.join("podman"),
+        r#"#!/bin/sh
+if [ "$1" = "system" ] && [ "$2" = "service" ]; then
+    exit 0
+fi
+exit 0
+"#,
+    );
+
+    let output = Command::new("/bin/sh")
+        .arg(entrypoint_path())
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("printf 'gitlab.com ssh-ed25519 BBBB\n' >> \"$HOME/.ssh/known_hosts\"")
+        .env_clear()
+        .env("HOME", &home_dir)
+        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("CODEXBOX_SSH_KNOWN_HOSTS_SEED", &seed_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(&seed_path).unwrap(),
+        "github.com ssh-ed25519 AAAA\n"
+    );
+    assert_eq!(
+        fs::read_to_string(home_dir.join(".ssh/known_hosts")).unwrap(),
+        "github.com ssh-ed25519 AAAA\ngitlab.com ssh-ed25519 BBBB\n"
+    );
+}
+
+#[test]
 fn entrypoint_ignores_images_from_readonly_host_store_during_export() {
     let dir = tempdir().unwrap();
     let fake_bin = dir.path().join("fake-bin");
@@ -155,7 +213,7 @@ fn entrypoint_ignores_images_from_readonly_host_store_during_export() {
     fs::create_dir_all(&fake_bin).unwrap();
     fs::create_dir_all(&home_dir).unwrap();
     fs::create_dir_all(&socket_dir).unwrap();
-    let _socket = UnixListener::bind(socket_dir.join("podman.sock")).unwrap();
+    let _socket = symlink_socket_fixture(&socket_dir.join("podman.sock"));
 
     write_fake_podman(
         &fake_bin.join("podman"),
@@ -252,7 +310,7 @@ fn entrypoint_links_root_bash_init_files_when_missing() {
     fs::create_dir_all(&fake_bin).unwrap();
     fs::create_dir_all(&home_dir).unwrap();
     fs::create_dir_all(&socket_dir).unwrap();
-    let _socket = UnixListener::bind(socket_dir.join("podman.sock")).unwrap();
+    let _socket = symlink_socket_fixture(&socket_dir.join("podman.sock"));
 
     fs::write(home_dir.join(".bash_profile"), "existing profile").unwrap();
 
