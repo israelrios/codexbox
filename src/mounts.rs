@@ -44,7 +44,6 @@ pub fn base_mounts(user: &UserContext, writable_roots: &[PathBuf]) -> Result<Vec
     });
 
     let codex_dir = user.home_dir.join(".codex");
-    ensure_dir(&codex_dir)?;
     mounts.push(MountSpec {
         host: codex_dir.clone(),
         guest: codex_dir,
@@ -78,6 +77,19 @@ pub fn base_mounts(user: &UserContext, writable_roots: &[PathBuf]) -> Result<Vec
 
     mounts.extend(podman_persistence_mounts(user)?);
     Ok(dedupe_mounts(mounts))
+}
+
+pub fn prepare_runtime_dirs(user: &UserContext) -> Result<()> {
+    ensure_dir(&user.home_dir.join(".codex"))?;
+    ensure_dir(
+        &user
+            .home_dir
+            .join(".local")
+            .join("share")
+            .join("codexbox")
+            .join("containers"),
+    )?;
+    Ok(())
 }
 
 pub fn approved_env_mounts(candidates: &[EnvMountCandidate]) -> Vec<MountSpec> {
@@ -151,7 +163,6 @@ fn podman_persistence_mounts(user: &UserContext) -> Result<Vec<MountSpec>> {
         .join("share")
         .join("codexbox")
         .join("containers");
-    ensure_dir(&storage_root)?;
 
     let mut mounts = vec![MountSpec {
         host: storage_root,
@@ -213,8 +224,8 @@ mod tests {
     use crate::env_mounts::EnvMountCandidate;
 
     use super::{
-        base_mounts, filter_covered_env_candidates, MountMode, GUEST_ADDITIONAL_IMAGE_STORE,
-        GUEST_PODMAN_ROOT,
+        base_mounts, filter_covered_env_candidates, prepare_runtime_dirs, MountMode,
+        GUEST_ADDITIONAL_IMAGE_STORE, GUEST_PODMAN_ROOT,
     };
 
     #[test]
@@ -278,5 +289,25 @@ mod tests {
         assert!(!mounts
             .iter()
             .any(|mount| mount.host == home.join(".config/containers")));
+    }
+
+    #[test]
+    fn prepare_runtime_dirs_creates_only_runtime_state() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("workspace");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+
+        prepare_runtime_dirs(&UserContext {
+            uid: 1000,
+            gid: 1000,
+            home_dir: home.clone(),
+            cwd,
+        })
+        .unwrap();
+
+        assert!(home.join(".codex").is_dir());
+        assert!(home.join(".local/share/codexbox/containers").is_dir());
     }
 }

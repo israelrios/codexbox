@@ -1,18 +1,10 @@
 use std::collections::BTreeSet;
-use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
+use crate::config::{save_user_config, UserConfig};
 use crate::env_mounts::EnvMountCandidate;
 use crate::errors::{CodexboxError, Result};
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ApprovalDb {
-    #[serde(default)]
-    pub approved_paths: BTreeSet<PathBuf>,
-}
 
 pub trait ApprovalPrompt {
     fn confirm(&mut self, candidate: &EnvMountCandidate) -> Result<bool>;
@@ -52,63 +44,43 @@ impl ApprovalPrompt for StdioApprovalPrompt {
     }
 }
 
-pub fn load_approval_db(path: &Path) -> Result<ApprovalDb> {
-    if !path.exists() {
-        return Ok(ApprovalDb::default());
-    }
-
-    let contents = fs::read_to_string(path).map_err(|source| CodexboxError::ReadPath {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    serde_json::from_str(&contents).map_err(|source| CodexboxError::ParseJson {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-pub fn save_approval_db(path: &Path, db: &ApprovalDb) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| CodexboxError::WritePath {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-
-    let mut json = serde_json::to_string_pretty(db)?;
-    json.push('\n');
-
-    fs::write(path, json).map_err(|source| CodexboxError::WritePath {
-        path: path.to_path_buf(),
-        source,
-    })
+pub fn approved_candidates(
+    candidates: Vec<EnvMountCandidate>,
+    approved_paths: &BTreeSet<PathBuf>,
+) -> Vec<EnvMountCandidate> {
+    candidates
+        .into_iter()
+        .filter(|candidate| approved_paths.contains(&candidate.host_path))
+        .collect()
 }
 
 pub fn approve_candidates<P: ApprovalPrompt>(
     candidates: Vec<EnvMountCandidate>,
-    db_path: &Path,
+    approved_paths: &BTreeSet<PathBuf>,
+    user_config: &mut UserConfig,
+    config_path: &Path,
     prompt: &mut P,
 ) -> Result<Vec<EnvMountCandidate>> {
-    let mut db = load_approval_db(db_path)?;
     let mut approved = Vec::new();
     let mut changed = false;
 
     for candidate in candidates {
-        if db.approved_paths.contains(&candidate.host_path) {
+        if approved_paths.contains(&candidate.host_path) {
             approved.push(candidate);
             continue;
         }
 
         if prompt.confirm(&candidate)? {
-            db.approved_paths.insert(candidate.host_path.clone());
+            user_config
+                .approved_paths
+                .insert(candidate.host_path.clone());
             approved.push(candidate);
             changed = true;
         }
     }
 
     if changed {
-        save_approval_db(db_path, &db)?;
+        save_user_config(config_path, user_config)?;
     }
 
     Ok(approved)
@@ -117,10 +89,13 @@ pub fn approve_candidates<P: ApprovalPrompt>(
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
 
     use tempfile::tempdir;
 
-    use super::{approve_candidates, load_approval_db, ApprovalPrompt};
+    use super::{approve_candidates, approved_candidates, ApprovalPrompt};
+    use crate::config::{load_user_config, UserConfig};
     use crate::env_mounts::EnvMountCandidate;
 
     struct FixedPrompt {
@@ -136,20 +111,53 @@ mod tests {
     #[test]
     fn approve_candidates_persists_positive_answers() {
         let dir = tempdir().unwrap();
-        let db_path = dir.path().join("approvals.json");
+        let config_path = dir.path().join("codexbox-conf.json");
         let candidate = EnvMountCandidate {
             var_name: "SSH_AUTH_SOCK".into(),
             host_path: dir.path().join("sock"),
         };
+        let mut user_config = UserConfig::default();
 
         let mut prompt = FixedPrompt {
             answers: RefCell::new(vec![true]),
         };
 
-        let approved = approve_candidates(vec![candidate.clone()], &db_path, &mut prompt).unwrap();
-        let db = load_approval_db(&db_path).unwrap();
+        let approved = approve_candidates(
+            vec![candidate.clone()],
+            &BTreeSet::new(),
+            &mut user_config,
+            &config_path,
+            &mut prompt,
+        )
+        .unwrap();
+        let saved = load_user_config(&config_path).unwrap();
 
         assert_eq!(approved, vec![candidate.clone()]);
-        assert!(db.approved_paths.contains(&candidate.host_path));
+        assert!(saved.approved_paths.contains(&candidate.host_path));
+    }
+
+    #[test]
+    fn approved_candidates_filter_without_prompting() {
+        let approved = approved_candidates(
+            vec![
+                EnvMountCandidate {
+                    var_name: "A".into(),
+                    host_path: PathBuf::from("/tmp/a"),
+                },
+                EnvMountCandidate {
+                    var_name: "B".into(),
+                    host_path: PathBuf::from("/tmp/b"),
+                },
+            ],
+            &BTreeSet::from([PathBuf::from("/tmp/b")]),
+        );
+
+        assert_eq!(
+            approved,
+            vec![EnvMountCandidate {
+                var_name: "B".into(),
+                host_path: PathBuf::from("/tmp/b"),
+            }]
+        );
     }
 }

@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -14,17 +13,11 @@ use crate::mounts::{MountMode, MountSpec};
 pub const DEFAULT_IMAGE: &str = "localhost/codexbox:latest";
 const PATH_PREFIX_ENV: &str = "CODEXBOX_PATH_PREFIX";
 const IMAGE_EXPORT_DIR_ENV: &str = "CODEXBOX_IMAGE_EXPORT_DIR";
-const CONTAINER_COMMAND_ENV: &str = "CODEXBOX_CONTAINER_COMMAND";
+const IMAGE_FINGERPRINT_LABEL: &str = "io.github.codexbox.image-fingerprint";
 const CONTAINERFILE: &str = include_str!("../Containerfile");
 const CONTAINERS_CONF: &[u8] = include_bytes!("../containers.conf");
 const PODMAN_CONTAINERS_CONF: &[u8] = include_bytes!("../podman-containers.conf");
 const CONTAINER_ENTRYPOINT: &[u8] = include_bytes!("../container-entrypoint.sh");
-
-#[derive(Debug, Clone)]
-pub enum ContainerCommand {
-    Codex(Vec<OsString>),
-    Shell(String),
-}
 
 #[derive(Debug, Clone)]
 pub struct PodmanPlan {
@@ -33,7 +26,7 @@ pub struct PodmanPlan {
     pub publish: Vec<String>,
     pub env: ForwardedEnv,
     pub extra_env: Vec<(String, String)>,
-    pub container_command: ContainerCommand,
+    pub command: Vec<String>,
     pub home_dir: std::path::PathBuf,
     pub workdir: std::path::PathBuf,
 }
@@ -90,16 +83,23 @@ impl ImageExportDir {
 }
 
 pub fn ensure_image(image: &str, rebuild: bool) -> Result<()> {
-    if !rebuild && image_exists(image)? {
+    let fingerprint = embedded_image_fingerprint();
+    if !rebuild && image_is_fresh(image, &fingerprint)? {
         return Ok(());
     }
 
+    build_image(image, &fingerprint)
+}
+
+fn build_image(image: &str, fingerprint: &str) -> Result<()> {
     let context = EmbeddedBuildContext::create()?;
 
     let status = Command::new("podman")
         .arg("build")
         .arg("--tag")
         .arg(image)
+        .arg("--label")
+        .arg(format!("{IMAGE_FINGERPRINT_LABEL}={fingerprint}"))
         .arg("--file")
         .arg(context.containerfile_path())
         .arg(context.path())
@@ -113,6 +113,27 @@ pub fn ensure_image(image: &str, rebuild: bool) -> Result<()> {
             status.code(),
         )))
     }
+}
+
+fn image_is_fresh(image: &str, fingerprint: &str) -> Result<bool> {
+    if !image_exists(image)? {
+        return Ok(false);
+    }
+
+    let output = Command::new("podman")
+        .arg("image")
+        .arg("inspect")
+        .arg("--format")
+        .arg(image_fingerprint_format())
+        .arg(image)
+        .output()
+        .map_err(CodexboxError::PodmanSpawn)?;
+
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == fingerprint)
 }
 
 pub fn run_plan(plan: &PodmanPlan, user: &UserContext) -> Result<i32> {
@@ -173,7 +194,7 @@ fn build_command(plan: &PodmanPlan, user: &UserContext) -> Command {
     if let Some(path_prefix) = &plan.env.path_prefix {
         let mut pair = String::from(PATH_PREFIX_ENV);
         pair.push('=');
-        pair.push_str(&path_prefix.to_string_lossy());
+        pair.push_str(path_prefix);
         command.arg("--env").arg(pair);
     }
 
@@ -182,28 +203,19 @@ fn build_command(plan: &PodmanPlan, user: &UserContext) -> Command {
     }
 
     for (key, value) in &plan.env.vars {
-        if key.to_string_lossy() == "PATH" {
+        if key == "PATH" {
             continue;
         }
 
-        let mut pair = key.to_string_lossy().into_owned();
+        let mut pair = key.clone();
         pair.push('=');
-        pair.push_str(&value.to_string_lossy());
+        pair.push_str(value);
         command.arg("--env").arg(pair);
     }
 
-    if let ContainerCommand::Shell(shell_command) = &plan.container_command {
-        command
-            .arg("--env")
-            .arg(format!("{CONTAINER_COMMAND_ENV}={shell_command}"));
-    }
-
     command.arg(&plan.image);
-    if let ContainerCommand::Codex(codex_args) = &plan.container_command {
-        command.arg("--dangerously-bypass-approvals-and-sandbox");
-        for arg in codex_args {
-            command.arg(arg);
-        }
+    for arg in &plan.command {
+        command.arg(arg);
     }
 
     command
@@ -218,6 +230,49 @@ fn image_exists(image: &str) -> Result<bool> {
         .map_err(CodexboxError::PodmanSpawn)?;
 
     Ok(status.success())
+}
+
+fn image_fingerprint_format() -> String {
+    format!("{{{{ index .Config.Labels \"{IMAGE_FINGERPRINT_LABEL}\" }}}}")
+}
+
+fn embedded_image_fingerprint() -> String {
+    let mut hash = Fnv1a64::new();
+
+    for chunk in [
+        env!("CARGO_PKG_VERSION").as_bytes(),
+        CONTAINERFILE.as_bytes(),
+        CONTAINERS_CONF,
+        PODMAN_CONTAINERS_CONF,
+        CONTAINER_ENTRYPOINT,
+    ] {
+        hash.write(chunk);
+        hash.write(&[0]);
+    }
+
+    format!("{:016x}", hash.finish())
+}
+
+struct Fnv1a64(u64);
+
+impl Fnv1a64 {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+
+    fn new() -> Self {
+        Self(Self::OFFSET_BASIS)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
 }
 
 pub fn create_image_export_dir(user: &UserContext) -> Result<ImageExportDir> {
@@ -339,7 +394,9 @@ mod tests {
     use crate::env_filter::ForwardedEnv;
     use crate::mounts::{MountMode, MountSource, MountSpec};
 
-    use super::{format_mount, render_plan, ContainerCommand, PodmanPlan};
+    use super::{
+        embedded_image_fingerprint, format_mount, image_fingerprint_format, render_plan, PodmanPlan,
+    };
 
     #[test]
     fn format_mount_uses_bind_syntax() {
@@ -393,7 +450,12 @@ mod tests {
                 "CODEXBOX_IMAGE_EXPORT_DIR".into(),
                 "/var/lib/codexbox-image-exports".into(),
             )],
-            container_command: ContainerCommand::Codex(vec!["--model".into(), "gpt-5.4".into()]),
+            command: vec![
+                "codex".into(),
+                "--dangerously-bypass-approvals-and-sandbox".into(),
+                "--model".into(),
+                "gpt-5.4".into(),
+            ],
             home_dir: user.home_dir.clone(),
             workdir: user.cwd.clone(),
         };
@@ -410,13 +472,12 @@ mod tests {
         );
         assert!(!rendered.contains("--env PATH="));
         assert!(rendered.contains(
-            "localhost/codexbox:latest --dangerously-bypass-approvals-and-sandbox --model gpt-5.4"
+            "localhost/codexbox:latest codex --dangerously-bypass-approvals-and-sandbox --model gpt-5.4"
         ));
-        assert!(!rendered.contains("localhost/codexbox:latest codex "));
     }
 
     #[test]
-    fn render_plan_supports_shell_command_override() {
+    fn render_plan_supports_argv_command_override() {
         let user = UserContext {
             uid: 1000,
             gid: 1000,
@@ -432,10 +493,7 @@ mod tests {
                 path_prefix: None,
             },
             extra_env: Vec::new(),
-            container_command: ContainerCommand::Shell(
-                "podman run --rm --entrypoint /bin/sh localhost/codexbox:latest -lc 'echo ok'"
-                    .into(),
-            ),
+            command: vec!["podman".into(), "info".into()],
             home_dir: user.home_dir.clone(),
             workdir: user.cwd.clone(),
         };
@@ -443,8 +501,23 @@ mod tests {
         let rendered = render_plan(&plan, &user);
 
         assert!(rendered.contains("--publish 9090:90"));
-        assert!(rendered.contains("CODEXBOX_CONTAINER_COMMAND="));
-        assert!(rendered.contains("podman run --rm --entrypoint /bin/sh localhost/codexbox:latest"));
-        assert!(!rendered.contains("--dangerously-bypass-approvals-and-sandbox"));
+        assert!(rendered.ends_with("localhost/codexbox:latest podman info"));
+    }
+
+    #[test]
+    fn embedded_image_fingerprint_is_stable_shape() {
+        let fingerprint = embedded_image_fingerprint();
+
+        assert_eq!(fingerprint.len(), 16);
+        assert!(fingerprint.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(fingerprint, embedded_image_fingerprint());
+    }
+
+    #[test]
+    fn image_inspect_format_reads_the_fingerprint_label() {
+        assert_eq!(
+            image_fingerprint_format(),
+            "{{ index .Config.Labels \"io.github.codexbox.image-fingerprint\" }}"
+        );
     }
 }

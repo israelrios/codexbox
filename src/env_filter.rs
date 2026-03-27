@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
@@ -7,19 +6,19 @@ use crate::errors::{CodexboxError, Result};
 
 #[derive(Debug, Clone, Default)]
 pub struct ForwardedEnv {
-    pub vars: BTreeMap<OsString, OsString>,
-    pub path_prefix: Option<OsString>,
+    pub vars: BTreeMap<String, String>,
+    pub path_prefix: Option<String>,
 }
 
 pub fn filter_environment(patterns: &[String]) -> Result<ForwardedEnv> {
-    filter_environment_from_iter(std::env::vars_os(), patterns)
+    filter_environment_from_iter(std::env::vars(), patterns)
 }
 
 pub fn filter_environment_from_iter<I, K, V>(iter: I, patterns: &[String]) -> Result<ForwardedEnv>
 where
     I: IntoIterator<Item = (K, V)>,
-    K: Into<OsString>,
-    V: Into<OsString>,
+    K: Into<String>,
+    V: Into<String>,
 {
     let matcher = build_matcher(patterns)?;
     let mut vars = BTreeMap::new();
@@ -27,18 +26,21 @@ where
 
     for (key, value) in iter.into_iter() {
         let key = key.into();
-        let key_text = key.to_string_lossy();
-
-        if key_text != "PATH" && matcher.is_match(key_text.as_ref()) {
+        if key.starts_with("CODEXBOX_") {
             continue;
         }
 
-        let value = if key_text == "PATH" {
-            let sanitized = sanitize_path_value(&value.into());
-            path_prefix = Some(sanitized.clone());
+        if key != "PATH" && matcher.is_match(&key) {
+            continue;
+        }
+
+        let value = value.into();
+        let value = if key == "PATH" {
+            let sanitized = sanitize_path_value(&value);
+            path_prefix = (!sanitized.is_empty()).then_some(sanitized.clone());
             sanitized
         } else {
-            value.into()
+            value
         };
 
         vars.insert(key, value);
@@ -47,15 +49,12 @@ where
     Ok(ForwardedEnv { vars, path_prefix })
 }
 
-fn sanitize_path_value(value: &OsString) -> OsString {
-    let text = value.to_string_lossy();
-    let filtered = text
+fn sanitize_path_value(value: &str) -> String {
+    value
         .split(':')
         .filter(|segment| !is_usr_path_segment(segment))
         .collect::<Vec<_>>()
-        .join(":");
-
-    OsString::from(filtered)
+        .join(":")
 }
 
 fn is_usr_path_segment(segment: &str) -> bool {
@@ -83,35 +82,26 @@ fn build_matcher(patterns: &[String]) -> Result<GlobSet> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
-
     use super::filter_environment_from_iter;
 
     #[test]
     fn filter_environment_keeps_path_even_if_pattern_matches() {
         let env = vec![
-            (
-                OsString::from("PATH"),
-                OsString::from("/usr/bin:/opt/codex/bin:/usr/local/bin"),
-            ),
-            (
-                OsString::from("SSH_AUTH_SOCK"),
-                OsString::from("/tmp/ssh.sock"),
-            ),
-            (OsString::from("USER"), OsString::from("alice")),
+            ("PATH", "/usr/bin:/opt/codex/bin:/usr/local/bin"),
+            ("SSH_AUTH_SOCK", "/tmp/ssh.sock"),
+            ("USER", "alice"),
+            ("CODEXBOX_PATH_PREFIX", "/host/bin"),
         ];
 
         let forwarded = filter_environment_from_iter(env, &["PATH".into(), "SSH*".into()]).unwrap();
 
         assert_eq!(forwarded.vars.len(), 2);
         assert_eq!(
-            forwarded.vars.get(&OsString::from("PATH")),
-            Some(&OsString::from("/opt/codex/bin"))
+            forwarded.vars.get("PATH"),
+            Some(&"/opt/codex/bin".to_string())
         );
-        assert_eq!(
-            forwarded.path_prefix,
-            Some(OsString::from("/opt/codex/bin"))
-        );
-        assert!(forwarded.vars.contains_key(&OsString::from("USER")));
+        assert_eq!(forwarded.path_prefix, Some("/opt/codex/bin".into()));
+        assert!(forwarded.vars.contains_key("USER"));
+        assert!(!forwarded.vars.contains_key("CODEXBOX_PATH_PREFIX"));
     }
 }

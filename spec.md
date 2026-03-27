@@ -50,7 +50,7 @@ Optional future subcommands may exist, but the default behavior is launching Cod
 4. maps `~/.config/glab-cli`
 5. maps each existing path listed in `sandbox_workspace_write.writable_roots` from `~/.codex/config.toml`
 6. skips missing writable roots, so stale entries in `config.toml` do not break launch
-7. forwards the invoking shell environment, excluding keys matched by `vars-to-ignore.txt`
+7. forwards the invoking shell environment, excluding keys matched by built-in ignore patterns plus user-configured extensions
 8. forwards the invoking shell’s current `PATH`
 9. examines forwarded environment variable values and, when they reference existing host file, directory, or socket paths, mounts those paths read-only
 10. requires one-time interactive approval before adding any new env-var-derived mount
@@ -84,7 +84,7 @@ The crate shall contain these main components:
 Normative startup flow:
 
 1. determine invoking user context
-2. load `vars-to-ignore.txt`
+2. load built-in ignore patterns and merge user-configured extensions from `~/.codexbox-conf.json`
 3. read the invoking shell environment
 4. filter environment variables
 5. load `~/.codex/config.toml`
@@ -179,24 +179,13 @@ pub struct SandboxWorkspaceWrite {
 
 ### 8.1 Filtering source
 
-The launcher shall read ignored environment variables glob patterns from:
-
-```text
-vars-to-ignore.txt
-```
-
-The file format shall be simple and line-oriented:
-
-* blank lines ignored
-* lines beginning with `#` ignored
-* each remaining line is a pattern or exact key matcher
-* first implementation may use exact key match only
+The launcher shall use a built-in list of ignored environment-variable glob patterns and allow the user to extend that list through `~/.codexbox-conf.json`.
 
 ### 8.2 Forwarding rules
 
 For each environment variable in the invoking shell:
 
-* if its key matches `vars-to-ignore.txt`, do not forward it
+* if its key matches the built-in or user-configured ignore patterns, do not forward it
 * otherwise forward it unchanged
 * explicitly preserve the current invoking shell `PATH`
 
@@ -268,17 +257,28 @@ Suggested schema:
 {
   "approved_paths": [
     "/run/user/1000/keyring/ssh",
-    "/home/israel/.ssh",
     "/home/israel/.config/something"
-  ]
+  ],
+  "publish": ["127.0.0.1:8080:80"],
+  "add_dirs": ["~/shared"],
+  "directories": {
+    "~/work/project": {
+      "publish": ["3000:3000"],
+      "add_dirs": ["~/project-extra"]
+    }
+  }
 }
 ```
 
 Suggested Rust type:
 
 ```rust
-pub struct CodexboxApprovalDb {
+pub struct UserConfig {
     pub approved_paths: BTreeSet<PathBuf>,
+    pub publish: Vec<String>,
+    pub add_dirs: Vec<PathBuf>,
+    pub ignore_var_patterns: Vec<String>,
+    pub directories: BTreeMap<String, DirectoryConfig>,
 }
 ```
 
@@ -304,7 +304,7 @@ Approve and remember? [y/N]
 
 If approved:
 
-* add to `~/.codexbox-conf.json`
+* add to `approved_paths` in `~/.codexbox-conf.json`
 * do not ask again on future launches
 
 If denied:
@@ -353,6 +353,10 @@ podman run --rm -it --sysctl net.ipv4.ip_unprivileged_port_start=0 --device /dev
 ### 12.1 Persistent user Podman storage
 
 Any Podman image created inside the sandbox must be stored in the user’s normal Podman storage.
+
+### 12.2 Embedded image freshness
+
+The launcher shall embed the container build assets into the binary and rebuild the sandbox image automatically when the embedded asset fingerprint differs from the image already present on the host.
 
 ## 13. Podman policy
 
@@ -431,15 +435,20 @@ codexbox/
 ```rust
 pub struct LauncherConfig {
     pub ignore_var_patterns: Vec<String>,
-    pub approval_db_path: PathBuf,
+    pub config_path: PathBuf,
+    pub user_config: UserConfig,
 }
 ```
 
-### 16.2 Approval DB
+### 16.2 User config
 
 ```rust
-pub struct ApprovalDb {
+pub struct UserConfig {
     pub approved_paths: BTreeSet<PathBuf>,
+    pub publish: Vec<String>,
+    pub add_dirs: Vec<PathBuf>,
+    pub ignore_var_patterns: Vec<String>,
+    pub directories: BTreeMap<String, DirectoryConfig>,
 }
 ```
 
@@ -472,7 +481,8 @@ pub enum MountSource {
 
 ```rust
 pub struct ForwardedEnv {
-    pub vars: BTreeMap<OsString, OsString>,
+    pub vars: BTreeMap<String, String>,
+    pub path_prefix: Option<String>,
 }
 ```
 
@@ -497,7 +507,8 @@ pub struct EnvMountCandidate {
 
 ### `env_filter.rs`
 
-* load `vars-to-ignore.txt`
+* load built-in ignore patterns
+* merge user-configured ignore-pattern extensions
 * filter environment variables
 * preserve current `PATH`
 
@@ -538,7 +549,7 @@ pub struct EnvMountCandidate {
 5. `~/.config/glab-cli` is mounted read-only if present
 6. existing paths from `sandbox_workspace_write.writable_roots` are mounted read-write
 7. missing writable roots do not break launch
-8. environment variables matched by `vars-to-ignore.txt` are excluded
+8. environment variables matched by the built-in or user-configured ignore patterns are excluded
 9. `PATH` from the invoking shell is forwarded
 10. env-var-referenced existing file, directory, and socket paths are detected as readonly mount candidates
 11. unapproved env-var-derived mounts trigger a one-time interactive approval prompt

@@ -1,5 +1,3 @@
-use std::ffi::OsString;
-
 use clap::Parser;
 
 #[derive(Debug, Parser)]
@@ -29,17 +27,18 @@ pub struct Cli {
 
     #[arg(
         long,
-        env = "CODEXBOX_CONTAINER_COMMAND",
-        value_name = "COMMAND",
+        value_name = "ARG",
+        num_args = 1..,
+        allow_hyphen_values = true,
         conflicts_with = "codex_args",
-        help = "Run a shell command inside the container instead of codex"
+        help = "Run an argv command inside the container instead of codex"
     )]
-    pub container_command: Option<String>,
+    pub container_command: Option<Vec<String>>,
 
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
         help = "Extra arguments forwarded to codex"
     )]
-    pub codex_args: Vec<OsString>,
+    pub codex_args: Vec<String>,
 }

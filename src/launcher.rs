@@ -1,23 +1,21 @@
-use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::approval::{approve_candidates, StdioApprovalPrompt};
+use crate::approval::{approve_candidates, approved_candidates, StdioApprovalPrompt};
 use crate::certs::discover_ca_trust_paths;
 use crate::cli::Cli;
 use crate::codex_config::{existing_writable_roots, load_codex_toml};
-use crate::config::{load_launcher_config, load_workspace_codexbox_config, UserContext};
+use crate::config::{load_launcher_config, UserContext};
 use crate::env_filter::filter_environment;
 use crate::env_mounts::discover_env_mount_candidates;
 use crate::errors::Result;
 use crate::mounts::{
     approved_env_mounts, base_mounts, ca_mounts, combine_mounts, filter_covered_env_candidates,
-    MountMode, MountSource, MountSpec,
+    prepare_runtime_dirs, MountMode, MountSource, MountSpec,
 };
 use crate::podman::{
     create_image_export_dir, dry_run_image_export_dir, ensure_image, image_export_env,
-    import_exported_images, render_plan, run_plan, ContainerCommand, PodmanPlan, DEFAULT_IMAGE,
+    import_exported_images, render_plan, run_plan, PodmanPlan, DEFAULT_IMAGE,
 };
 
 pub fn launch(cli: Cli) -> Result<i32> {
@@ -31,12 +29,11 @@ pub fn launch(cli: Cli) -> Result<i32> {
     } = cli;
 
     let user = UserContext::detect()?;
-    let config = load_launcher_config(&user);
-    let workspace_config = load_workspace_codexbox_config(&user.cwd)?;
+    let mut config = load_launcher_config(&user)?;
     let filtered_env = filter_environment(&config.ignore_var_patterns)?;
     let codex_config = load_codex_toml(&user.home_dir)?;
     let writable_roots = existing_writable_roots(&codex_config, &user.home_dir);
-    let add_dirs = resolve_add_dir_paths(&codex_args, &workspace_config.add_dirs, &user);
+    let add_dirs = resolve_add_dir_paths(&codex_args, &config.effective_config.add_dirs, &user);
     let base_mounts = combine_mounts(&[
         base_mounts(&user, &writable_roots)?,
         codex_add_dir_mounts(&add_dirs),
@@ -45,20 +42,25 @@ pub fn launch(cli: Cli) -> Result<i32> {
     let env_candidates = filter_covered_env_candidates(env_candidates, &base_mounts);
 
     let approved_candidates = if dry_run {
-        env_candidates
+        approved_candidates(env_candidates, &config.effective_config.approved_paths)
     } else {
         let mut prompt = StdioApprovalPrompt;
-        approve_candidates(env_candidates, &config.approval_db_path, &mut prompt)?
+        approve_candidates(
+            env_candidates,
+            &config.effective_config.approved_paths,
+            &mut config.user_config,
+            &config.config_path,
+            &mut prompt,
+        )?
     };
     let ca_paths = discover_ca_trust_paths();
     let image = image.unwrap_or_else(|| DEFAULT_IMAGE.to_string());
-    let publish = merge_publish(&workspace_config.publish, publish);
-    let container_command = match container_command {
-        Some(command) => ContainerCommand::Shell(command),
-        None => ContainerCommand::Codex(extend_codex_args_with_add_dirs(
+    let publish = merge_publish(&config.effective_config.publish, publish);
+    let command = container_command.unwrap_or_else(|| {
+        codex_command(extend_codex_args_with_add_dirs(
             codex_args, &add_dirs, &user,
-        )),
-    };
+        ))
+    });
     let export_guest_dir = std::path::PathBuf::from("/var/lib/codexbox-image-exports");
 
     if dry_run {
@@ -78,7 +80,7 @@ pub fn launch(cli: Cli) -> Result<i32> {
             publish,
             env: filtered_env,
             extra_env: vec![image_export_env(&export_guest_dir)],
-            container_command,
+            command,
             home_dir: user.home_dir.clone(),
             workdir: user.cwd.clone(),
         };
@@ -87,6 +89,7 @@ pub fn launch(cli: Cli) -> Result<i32> {
         return Ok(0);
     }
 
+    prepare_runtime_dirs(&user)?;
     ensure_image(&image, rebuild_image)?;
 
     let export_host_dir = create_image_export_dir(&user)?;
@@ -106,7 +109,7 @@ pub fn launch(cli: Cli) -> Result<i32> {
         publish,
         env: filtered_env,
         extra_env: vec![image_export_env(&export_guest_dir)],
-        container_command,
+        command,
         home_dir: user.home_dir.clone(),
         workdir: user.cwd.clone(),
     };
@@ -115,6 +118,15 @@ pub fn launch(cli: Cli) -> Result<i32> {
     import_exported_images(export_host_dir.path())?;
 
     Ok(exit_code)
+}
+
+fn codex_command(codex_args: Vec<String>) -> Vec<String> {
+    let mut command = vec![
+        "codex".into(),
+        "--dangerously-bypass-approvals-and-sandbox".into(),
+    ];
+    command.extend(codex_args);
+    command
 }
 
 fn codex_add_dir_mounts(add_dirs: &[PathBuf]) -> Vec<MountSpec> {
@@ -131,33 +143,28 @@ fn codex_add_dir_mounts(add_dirs: &[PathBuf]) -> Vec<MountSpec> {
 }
 
 fn resolve_add_dir_paths(
-    codex_args: &[OsString],
+    codex_args: &[String],
     configured_add_dirs: &[PathBuf],
     user: &UserContext,
 ) -> Vec<PathBuf> {
     let mut add_dirs = Vec::new();
 
-    for path in extract_add_dir_paths(codex_args)
-        .into_iter()
-        .chain(configured_add_dirs.iter().cloned())
-    {
-        let Some(path) = normalize_add_dir(path, user) else {
-            continue;
-        };
+    for path in extract_add_dir_paths(codex_args) {
+        push_add_dir(&mut add_dirs, path, &user.cwd, &user.home_dir);
+    }
 
-        if !add_dirs.contains(&path) {
-            add_dirs.push(path);
-        }
+    for path in configured_add_dirs.iter().cloned() {
+        push_add_dir(&mut add_dirs, path, &user.home_dir, &user.home_dir);
     }
 
     add_dirs
 }
 
 fn extend_codex_args_with_add_dirs(
-    mut codex_args: Vec<OsString>,
+    mut codex_args: Vec<String>,
     add_dirs: &[PathBuf],
     user: &UserContext,
-) -> Vec<OsString> {
+) -> Vec<String> {
     let existing_add_dirs = resolve_add_dir_paths(&codex_args, &[], user);
 
     for path in add_dirs {
@@ -166,7 +173,7 @@ fn extend_codex_args_with_add_dirs(
         }
 
         codex_args.push("--add-dir".into());
-        codex_args.push(path.clone().into_os_string());
+        codex_args.push(path.to_string_lossy().into_owned());
     }
 
     codex_args
@@ -184,13 +191,13 @@ fn merge_publish(configured_publish: &[String], cli_publish: Vec<String>) -> Vec
     publish
 }
 
-fn extract_add_dir_paths(codex_args: &[OsString]) -> Vec<PathBuf> {
+fn extract_add_dir_paths(codex_args: &[String]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let mut index = 0;
 
     while index < codex_args.len() {
         let arg = &codex_args[index];
-        if arg == OsStr::new("--add-dir") {
+        if arg == "--add-dir" {
             if let Some(path) = codex_args.get(index + 1) {
                 paths.push(PathBuf::from(path));
                 index += 1;
@@ -205,41 +212,57 @@ fn extract_add_dir_paths(codex_args: &[OsString]) -> Vec<PathBuf> {
     paths
 }
 
-fn add_dir_inline_value(arg: &OsString) -> Option<PathBuf> {
-    const PREFIX: &[u8] = b"--add-dir=";
-
-    let bytes = arg.as_os_str().as_bytes();
-    if !bytes.starts_with(PREFIX) || bytes.len() == PREFIX.len() {
-        return None;
-    }
-
-    Some(PathBuf::from(OsString::from_vec(
-        bytes[PREFIX.len()..].to_vec(),
-    )))
+fn add_dir_inline_value(arg: &str) -> Option<PathBuf> {
+    arg.strip_prefix("--add-dir=")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
-fn normalize_add_dir(path: PathBuf, user: &UserContext) -> Option<PathBuf> {
+fn push_add_dir(add_dirs: &mut Vec<PathBuf>, path: PathBuf, base_dir: &Path, home_dir: &Path) {
+    let Some(path) = normalize_add_dir(path, base_dir, home_dir) else {
+        return;
+    };
+
+    if !add_dirs.contains(&path) {
+        add_dirs.push(path);
+    }
+}
+
+fn normalize_add_dir(path: PathBuf, base_dir: &Path, home_dir: &Path) -> Option<PathBuf> {
+    let path = expand_tilde(path, home_dir);
     let path = if path.is_absolute() {
         path
     } else {
-        user.cwd.join(path)
+        base_dir.join(path)
     };
 
     let path = fs::canonicalize(&path).unwrap_or(path);
     path.is_dir().then_some(path)
 }
 
+fn expand_tilde(path: PathBuf, home_dir: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        return home_dir.to_path_buf();
+    }
+
+    if let Some(stripped) = raw.strip_prefix("~/") {
+        return home_dir.join(stripped);
+    }
+
+    path
+}
+
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
 
     use tempfile::tempdir;
 
     use super::{
-        codex_add_dir_mounts, extend_codex_args_with_add_dirs, extract_add_dir_paths,
-        merge_publish, resolve_add_dir_paths,
+        codex_add_dir_mounts, codex_command, extend_codex_args_with_add_dirs,
+        extract_add_dir_paths, merge_publish, resolve_add_dir_paths,
     };
     use crate::config::UserContext;
     use crate::mounts::{MountMode, MountSource};
@@ -283,7 +306,7 @@ mod tests {
             &[
                 "--add-dir".into(),
                 "../shared".into(),
-                format!("--add-dir={}", sibling.display()).into(),
+                format!("--add-dir={}", sibling.display()),
             ],
             &[PathBuf::from("../configured"), PathBuf::from("/missing")],
             &user,
@@ -328,7 +351,7 @@ mod tests {
                 "--model".into(),
                 "gpt-5.4".into(),
                 "--add-dir".into(),
-                shared.clone().into_os_string(),
+                shared.to_string_lossy().into_owned(),
             ],
             &[shared.clone(), configured.clone()],
             &UserContext {
@@ -342,12 +365,12 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                OsString::from("--model"),
-                OsString::from("gpt-5.4"),
-                OsString::from("--add-dir"),
-                shared.into_os_string(),
-                OsString::from("--add-dir"),
-                configured.into_os_string(),
+                "--model".to_string(),
+                "gpt-5.4".to_string(),
+                "--add-dir".to_string(),
+                shared.to_string_lossy().into_owned(),
+                "--add-dir".to_string(),
+                configured.to_string_lossy().into_owned(),
             ]
         );
     }
@@ -360,5 +383,18 @@ mod tests {
         );
 
         assert_eq!(publish, vec!["127.0.0.1:8080:80", "8443:443", "3000:3000"]);
+    }
+
+    #[test]
+    fn codex_command_wraps_codex_args_in_argv_form() {
+        assert_eq!(
+            codex_command(vec!["--model".into(), "gpt-5.4".into()]),
+            vec![
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model",
+                "gpt-5.4"
+            ]
+        );
     }
 }

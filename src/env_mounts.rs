@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -20,8 +19,12 @@ pub fn discover_env_mount_candidates(
     let mut candidates = BTreeMap::<PathBuf, String>::new();
 
     for (key, value) in &env.vars {
-        let var_name = key.to_string_lossy().into_owned();
+        if value.contains("://") {
+            continue;
+        }
+
         for path in value_segments(value) {
+            let var_name = key.clone();
             if var_name == "PATH" && is_usr_path(&path) {
                 continue;
             }
@@ -60,9 +63,9 @@ fn is_usr_path(path: &Path) -> bool {
     path == Path::new("/usr") || path.starts_with("/usr")
 }
 
-fn value_segments(value: &OsString) -> Vec<PathBuf> {
-    let text = value.to_string_lossy();
-    text.split(':')
+fn value_segments(value: &str) -> Vec<PathBuf> {
+    value
+        .split(':')
         .filter(|segment| !segment.is_empty())
         .map(PathBuf::from)
         .collect()
@@ -71,7 +74,6 @@ fn value_segments(value: &OsString) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::ffi::OsString;
     use std::fs;
     use std::os::unix::net::UnixListener;
     use std::path::Path;
@@ -96,22 +98,13 @@ mod tests {
 
         let forwarded = ForwardedEnv {
             vars: BTreeMap::from([
+                ("CERT_PATH".into(), file.to_string_lossy().to_string()),
                 (
-                    OsString::from("CERT_PATH"),
-                    OsString::from(file.to_string_lossy().to_string()),
+                    "MANY".into(),
+                    format!("{}:{}", folder.display(), socket.display()),
                 ),
-                (
-                    OsString::from("MANY"),
-                    OsString::from(format!("{}:{}", folder.display(), socket.display())),
-                ),
-                (
-                    OsString::from("HOME_PATH"),
-                    OsString::from(home.to_string_lossy().to_string()),
-                ),
-                (
-                    OsString::from("PATH"),
-                    OsString::from(format!("/usr/bin:{}", folder.display())),
-                ),
+                ("HOME_PATH".into(), home.to_string_lossy().to_string()),
+                ("PATH".into(), format!("/usr/bin:{}", folder.display())),
             ]),
             path_prefix: None,
         };
@@ -126,5 +119,24 @@ mod tests {
         assert!(!candidates
             .iter()
             .any(|item| item.host_path == Path::new("/usr/bin")));
+    }
+
+    #[test]
+    fn discover_candidates_ignores_url_like_values() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let forwarded = ForwardedEnv {
+            vars: BTreeMap::from([
+                ("SERVICE_URL".into(), "http://tmp".into()),
+                ("GRPC_TARGET".into(), "grpc://tmp".into()),
+            ]),
+            path_prefix: None,
+        };
+
+        let candidates = discover_env_mount_candidates(&forwarded, &home);
+
+        assert!(candidates.is_empty());
     }
 }

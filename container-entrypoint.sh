@@ -49,15 +49,11 @@ while [ ! -S "$XDG_RUNTIME_DIR/podman/podman.sock" ] && [ "$i" -lt 50 ]; do
 done
 
 if [ "$#" -eq 0 ]; then
-    set -- --dangerously-bypass-approvals-and-sandbox
+    set -- codex --dangerously-bypass-approvals-and-sandbox
 fi
 
 set +e
-if [ "${CODEXBOX_CONTAINER_COMMAND:-}" != "" ]; then
-    /bin/sh -lc "$CODEXBOX_CONTAINER_COMMAND"
-else
-    codex "$@"
-fi
+"$@"
 command_status=$?
 set -e
 
