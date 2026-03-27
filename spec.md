@@ -1,266 +1,73 @@
-# Codexbox — Rust implementation specification
+# Codexbox specification
 
-## 1. Purpose
+## 1. Scope
 
-`codexbox` is a Rust CLI launcher that starts **Codex** inside a **Podman** sandbox with a strict allowlist-based filesystem view, while allowing controlled access to specific user configuration, cache, credential, certificate, and tool paths.
+`codexbox` is a single self-contained Rust binary that launches Codex inside a Podman sandbox.
 
-The launcher must:
+The binary must:
 
-* allow only explicitly approved host paths outside the working directory
-* support rootless Podman inside the sandbox
-* support Docker-compatible workflows through Podman
-* preserve the invoking user’s ownership on writable bind mounts
-* automatically launch:
+- expose only explicit host mounts
+- preserve the invoking user on writable mounts
+- support rootless Podman and Docker-compatible workflows through Podman
+- embed its container build assets and default environment ignore list in the executable
 
-```bash
-codex --dangerously-bypass-approvals-and-sandbox
-```
+The built artifact must not depend on extra bundled runtime files. User-managed files in the home directory are allowed.
 
-inside the sandbox
+## 2. Launch model
 
----
-
-## 2. Program name
-
-The binary shall be named:
-
-```text
-codexbox
-```
-
-Primary execution model:
+- The program name is `codexbox`.
+- `codexbox [CODEx_ARGS...]` launches:
 
 ```bash
-codexbox
+codex --dangerously-bypass-approvals-and-sandbox [CODEx_ARGS...]
 ```
 
-This shall launch `codex --dangerously-bypass-approvals-and-sandbox` inside the prepared sandbox.
+- `--container-command <argv...>` replaces the default inner command with an argv vector.
+- The inner command model is argv-based only. No shell-string command channel is supported.
+- `--dry-run` prints the final `podman run` command and exits without mutating host state.
 
-Optional future subcommands may exist, but the default behavior is launching Codex.
+`--dry-run` must not:
 
----
+- create directories
+- rebuild images
+- write config
+- prompt for approvals
 
-## 3. Core required behaviors
+## 3. Supported inputs
 
-`codexbox` shall implement all of the following:
+`codexbox` reads from:
 
-1. maps `~/.codex`
-2. maps `~/.gitconfig`
-3. maps `~/.config/gh`
-4. maps `~/.config/glab-cli`
-5. maps each existing path listed in `sandbox_workspace_write.writable_roots` from `~/.codex/config.toml`
-6. skips missing writable roots, so stale entries in `config.toml` do not break launch
-7. forwards the invoking shell environment, excluding keys matched by built-in ignore patterns plus user-configured extensions
-8. forwards the invoking shell’s current `PATH`
-9. examines forwarded environment variable values and, when they reference existing host file, directory, or socket paths, mounts those paths read-only
-10. requires one-time interactive approval before adding any new env-var-derived mount
-11. stores approved env-var-derived mount paths in `~/.codexbox-conf.json`
-12. never auto-approves or mounts the user’s home directory root itself via env-var-derived mounts, though subpaths under home may be approved
-13. reuses the host CA trust store by bind-mounting host certificate paths read-only
-14. starts `codex --dangerously-bypass-approvals-and-sandbox` automatically
+1. the invoking process environment
+2. `~/.codex/config.toml`
+3. `~/.codexbox-conf.json`
 
----
+No repo-local `codexbox` config file is supported.
 
-## 4. High-level architecture
+Only UTF-8 is supported for:
 
-The crate shall contain these main components:
+- config files
+- environment keys and values
+- command arguments
+- persisted path strings
 
-* `cli.rs` — entrypoint/options
-* `config.rs` — reads codexbox config and approval DB
-* `codex_config.rs` — parses `~/.codex/config.toml`
-* `env_filter.rs` — captures and filters environment variables
-* `env_mounts.rs` — discovers candidate env-var-derived mounts
-* `approval.rs` — interactive one-time approval workflow
-* `mounts.rs` — constructs mount plan
-* `certs.rs` — host CA trust-store discovery
-* `podman.rs` — Podman plan builder and integration
-* `launcher.rs` — launches Codex
-* `errors.rs` — typed errors
+Missing optional config files are treated as empty config.
 
----
+## 4. User config
 
-## 5. Execution flow
-
-Normative startup flow:
-
-1. determine invoking user context
-2. load built-in ignore patterns and merge user-configured extensions from `~/.codexbox-conf.json`
-3. read the invoking shell environment
-4. filter environment variables
-5. load `~/.codex/config.toml`
-6. collect writable roots from `sandbox_workspace_write.writable_roots`
-7. collect fixed required mounts
-8. discover env-var-derived mount candidates
-9. remove disallowed candidates
-10. compare remaining candidates against `~/.codexbox-conf.json`
-11. interactively prompt for approval for new candidates
-12. persist newly approved candidates
-13. discover CA trust-store paths
-14. build Podman launch plan
-15. launch:
-
-```bash
-codex --dangerously-bypass-approvals-and-sandbox
-```
-
----
-
-## 6. Fixed required mounts
-
-The launcher shall always attempt to mount the following host paths when they exist.
-
-### 6.1 Required writable mounts
-
-These shall be mounted read-write:
-
-* current working directory
-* `~/.codex`
-* each existing path listed in:
-
-  * `sandbox_workspace_write.writable_roots` from `~/.codex/config.toml`
-
-If an entry from `writable_roots` does not exist, it shall be skipped silently or logged at debug level, but must not fail the launch.
-
-### 6.2 Required read-only mounts
-
-These shall be mounted read-only when they exist:
-
-* `~/.gitconfig`
-* `~/.config/gh`
-* `~/.config/glab-cli`
-* host CA trust-store paths
-* env-var-derived approved mounts
-
----
-
-## 7. Codex config parsing
-
-The launcher shall read:
-
-```text
-~/.codex/config.toml
-```
-
-and extract:
-
-```toml
-[sandbox_workspace_write]
-writable_roots = [ ... ]
-```
-
-### 7.1 Rules for `writable_roots`
-
-For each entry:
-
-* expand `~`
-* expand relative paths only if the codex config format explicitly permits them; otherwise treat them as invalid and skip with warning
-* canonicalize where practical
-* if the path exists on host, mount read-write
-* if the path does not exist, skip it
-* missing or stale roots must not abort startup
-
-Suggested Rust model:
-
-```rust
-pub struct CodexToml {
-    pub sandbox_workspace_write: Option<SandboxWorkspaceWrite>,
-}
-
-pub struct SandboxWorkspaceWrite {
-    pub writable_roots: Option<Vec<PathBuf>>,
-}
-```
-
----
-
-## 8. Environment forwarding
-
-`codexbox` shall forward the invoking shell environment into the sandbox, subject to filtering.
-
-### 8.1 Filtering source
-
-The launcher shall use a built-in list of ignored environment-variable glob patterns and allow the user to extend that list through `~/.codexbox-conf.json`.
-
-### 8.2 Forwarding rules
-
-For each environment variable in the invoking shell:
-
-* if its key matches the built-in or user-configured ignore patterns, do not forward it
-* otherwise forward it unchanged
-* explicitly preserve the current invoking shell `PATH`
-
-This means the sandbox inherits the current shell’s `PATH`, not a reconstructed one.
-
----
-
-## 9. Env-var-derived mount discovery
-
-After filtering the environment, the launcher shall inspect the values of forwarded variables and discover candidate bind mounts.
-
-### 9.1 Candidate detection
-
-A forwarded environment variable value may yield one or more candidate host paths if it contains a path-like reference.
-
-Supported cases in the initial implementation:
-
-* value is an absolute path to an existing file
-* value is an absolute path to an existing directory
-* value is an absolute path to an existing Unix socket
-* split colon-separated values and inspect each segment
-
-Examples:
-
-* `SSH_AUTH_SOCK=/run/user/1000/keyring/ssh`
-* `GPG_AGENT_INFO=/run/user/...`
-* `MY_CERT=/home/user/certs/dev.pem`
-* `SOME_DIR=/opt/tooling/cache`
-
-### 9.2 Mount mode
-
-All env-var-derived mounts shall be mounted **read-only**.
-
-### 9.3 Exclusions
-
-The launcher shall never add an env-var-derived bind mount for the user’s home directory root itself.
-
-Example:
-
-* `/home/israel` → forbidden
-* `/home/israel/.ssh` → forbidden
-* `/home/israel/projects/foo` → may be approved
-
-This rule applies even if the home root appears in an environment variable and even if the user attempts to approve it interactively.
-
-### 9.4 Existence requirement
-
-Only existing host paths may become candidates.
-
-If the referenced path does not exist on host, it shall not be added and no prompt shall be shown.
-
----
-
-## 10. Interactive approval model
-
-New env-var-derived mount candidates require one-time interactive approval.
-
-### 10.1 Approval storage
-
-Approvals shall be stored in:
+The user config file is:
 
 ```text
 ~/.codexbox-conf.json
 ```
 
-Suggested schema:
+Schema:
 
 ```json
 {
-  "approved_paths": [
-    "/run/user/1000/keyring/ssh",
-    "/home/israel/.config/something"
-  ],
+  "approved_paths": ["/run/user/1000/podman/podman.sock"],
   "publish": ["127.0.0.1:8080:80"],
   "add_dirs": ["~/shared"],
+  "ignore_var_patterns": ["MY_SECRET_*"],
   "directories": {
     "~/work/project": {
       "publish": ["3000:3000"],
@@ -270,329 +77,163 @@ Suggested schema:
 }
 ```
 
-Suggested Rust type:
+Rules:
 
-```rust
-pub struct UserConfig {
-    pub approved_paths: BTreeSet<PathBuf>,
-    pub publish: Vec<String>,
-    pub add_dirs: Vec<PathBuf>,
-    pub ignore_var_patterns: Vec<String>,
-    pub directories: BTreeMap<String, DirectoryConfig>,
-}
-```
+- `approved_paths` stores globally approved read-only env-derived mounts
+- `publish` adds Podman `--publish` entries
+- `add_dirs` adds extra writable directory mounts and matching `codex --add-dir` arguments
+- `ignore_var_patterns` extends the built-in environment ignore list
+- `directories` provides per-directory overrides for `publish` and `add_dirs` only
 
-### 10.2 Approval prompt behavior
+Path handling:
 
-When a candidate path:
+- `~` expands to the invoking user home directory
+- top-level config paths that are not absolute are resolved from the home directory
+- CLI `--add-dir` relative paths are resolved from the current working directory
+- configured directory overrides apply when the current working directory is inside the configured directory
+- if multiple directory overrides match, they are merged from shallowest match to deepest match
 
-* exists
-* is not home root
-* is not already approved
+There is no per-directory `approved_paths`.
 
-the launcher shall ask interactively whether to allow it.
+## 5. Codex config
 
-Example prompt shape:
+`codexbox` reads:
 
 ```text
-Allow readonly mount derived from environment variable SSH_AUTH_SOCK?
-Host path: /run/user/1000/keyring/ssh
-Approve and remember? [y/N]
+~/.codex/config.toml
 ```
 
-### 10.3 One-time behavior
+and extracts:
 
-If approved:
-
-* add to `approved_paths` in `~/.codexbox-conf.json`
-* do not ask again on future launches
-
-If denied:
-
-* do not mount it
-* do not persist approval
-
----
-
-## 11. Host CA trust-store reuse
-
-The launcher shall reuse the host CA trust store by bind-mounting host certificate paths read-only.
-
-### 11.1 Discovery behavior
-
-The launcher shall probe known certificate/trust-store locations and mount whichever exist.
-
-Typical paths to check include:
-
-* `/etc/ssl/certs`
-* `/etc/pki/tls/certs`
-* `/etc/ca-certificates`
-* `/etc/ssl/cert.pem`
-* `/etc/pki/ca-trust`
-* distribution-specific trust-store files or directories
-
-### 11.2 Mount mode
-
-All CA trust paths shall be mounted read-only.
-
-### 11.3 Goal
-
-Network tooling inside the sandbox should trust the same host CA roots as the invoking system.
-
----
-
-## 12. Podman and Docker compatibility
-
-`codexbox` shall support rootless Podman inside the sandbox.
-
-Suggested base podman command: 
-```bash
-podman run --rm -it --sysctl net.ipv4.ip_unprivileged_port_start=0 --device /dev/net/tun --device /dev/fuse
+```toml
+[sandbox_workspace_write]
+writable_roots = [ ... ]
 ```
 
-### 12.1 Persistent user Podman storage
+Rules for `writable_roots`:
 
-Any Podman image created inside the sandbox must be stored in the user’s normal Podman storage.
+- expand `~`
+- ignore missing or stale paths
+- use existing paths as writable mounts
+- do not fail startup because a configured root no longer exists
 
-### 12.2 Embedded image freshness
+## 6. Mount policy
 
-The launcher shall embed the container build assets into the binary and rebuild the sandbox image automatically when the embedded asset fingerprint differs from the image already present on the host.
+### 6.1 Writable mounts
 
-## 13. Podman policy
+The launcher must provide writable mounts for:
 
-The launcher shall construct a Podman environment that:
+- the current working directory
+- `~/.codex`
+- existing `writable_roots` from `~/.codex/config.toml`
+- valid directories from CLI or config `add_dirs`
+- internal Podman persistence paths needed by `codexbox`
 
-* mounts explicit allowlisted host paths only
-* uses read-only or read-write bind mode per policy
-* preserves the invoking user identity
-* launches Codex directly as the inner command
+`add_dirs` are mounted only when they resolve to existing directories.
 
-Recommended inner launch target:
+### 6.2 Read-only mounts
 
-```bash
-codex --dangerously-bypass-approvals-and-sandbox
-```
+The launcher must mount these read-only when present:
 
-### 13.1 Required mount classes
+- `~/.gitconfig`
+- `~/.config/gh`
+- `~/.config/glab-cli`
+- approved env-derived paths
+- discovered host CA trust paths
 
-#### User/config mounts
+Writable files created through bind mounts must remain owned by the invoking user on the host.
 
-* `~/.codex` read-write
-* `~/.gitconfig` read-only
-* `~/.config/gh` read-only
-* `~/.config/glab-cli` read-only
+## 7. Environment forwarding
 
-#### Dynamic mounts
+The launcher forwards the invoking environment after filtering.
 
-* writable roots from `~/.codex/config.toml`
-* approved env-var-derived readonly mounts
-* CA trust paths readonly
+Rules:
 
----
+- use an embedded built-in ignore-pattern list
+- extend that list with `ignore_var_patterns` from `~/.codexbox-conf.json`
+- do not forward any variable whose key matches the effective ignore list
+- explicitly preserve the invoking `PATH`
+- never forward internal `CODEXBOX_*` control variables
 
-## 14. Default launch command
+## 8. Env-derived mount discovery
 
-The launcher’s default behavior shall be equivalent to:
+After filtering the environment, `codexbox` inspects forwarded values for mount candidates.
 
-```bash
-codex --dangerously-bypass-approvals-and-sandbox
-```
+Candidate rules:
 
-No extra approval or sandbox flags shall be expected from the user.
+- skip any value containing `://`
+- otherwise split values on `:`
+- keep only absolute paths
+- keep only existing files, directories, or Unix sockets
+- mount all accepted candidates read-only
+- deduplicate repeated paths
 
-Extra params should be forwarded to codex,
+Policy rules:
 
----
+- the user home directory root itself must never be added through env-derived discovery
+- subpaths under the home directory may be approved
+- a candidate already covered by another mount should be ignored
 
-## 15. Rust crate structure
+Approval rules:
 
-Recommended layout:
+- new env-derived candidates require interactive one-time approval
+- approved paths are persisted to `approved_paths`
+- denied paths are not persisted
+- `--dry-run` uses only already-approved paths and must not prompt
 
-```text
-codexbox/
-  src/
-    main.rs
-    cli.rs
-    config.rs
-    codex_config.rs
-    env_filter.rs
-    env_mounts.rs
-    approval.rs
-    certs.rs
-    policy.rs
-    mounts.rs
-    podman.rs
-    launcher.rs
-    errors.rs
-```
+## 9. Certificates
 
----
+The launcher must reuse the host CA trust store by bind-mounting known host certificate locations read-only.
 
-## 16. Key Rust data structures
+Typical probe targets include:
 
-### 16.1 Launcher config
+- `/etc/ssl/certs`
+- `/etc/pki/tls/certs`
+- `/etc/ca-certificates`
+- `/etc/ssl/cert.pem`
+- `/etc/pki/ca-trust`
 
-```rust
-pub struct LauncherConfig {
-    pub ignore_var_patterns: Vec<String>,
-    pub config_path: PathBuf,
-    pub user_config: UserConfig,
-}
-```
+Only existing paths are mounted.
 
-### 16.2 User config
+## 10. Podman behavior
 
-```rust
-pub struct UserConfig {
-    pub approved_paths: BTreeSet<PathBuf>,
-    pub publish: Vec<String>,
-    pub add_dirs: Vec<PathBuf>,
-    pub ignore_var_patterns: Vec<String>,
-    pub directories: BTreeMap<String, DirectoryConfig>,
-}
-```
+The launcher builds and runs a Podman container for the sandbox.
 
-### 16.3 Mount spec
+Requirements:
 
-```rust
-pub enum MountMode {
-    ReadOnly,
-    ReadWrite,
-    Tmpfs,
-}
+- use rootless Podman
+- keep the runtime image build context embedded in the binary
+- rebuild the sandbox image when it is missing, when its embedded-asset fingerprint is stale, or when `--rebuild-image` is set
+- avoid rebuilding when the current image fingerprint already matches
+- keep Podman-created images available in the user environment outside the sandbox
 
-pub struct MountSpec {
-    pub host: PathBuf,
-    pub guest: PathBuf,
-    pub mode: MountMode,
-    pub source: MountSource,
-}
+The sandbox must support Docker-compatible workflows through Podman.
 
-pub enum MountSource {
-    Fixed,
-    CodexWritableRoot,
-    EnvDerived { var_name: String },
-    CaTrust,
-    Podman,
-}
-```
+## 11. Effective startup flow
 
-### 16.4 Forwarded environment
+Normative flow:
 
-```rust
-pub struct ForwardedEnv {
-    pub vars: BTreeMap<String, String>,
-    pub path_prefix: Option<String>,
-}
-```
+1. detect user context and current working directory
+2. load `~/.codexbox-conf.json` and compute effective directory overrides
+3. filter the invoking environment
+4. load `~/.codex/config.toml` and collect existing writable roots
+5. resolve `add_dirs`
+6. build fixed mounts
+7. discover env-derived mount candidates
+8. prompt for approval and persist new approvals unless `--dry-run`
+9. discover host CA trust paths
+10. ensure the sandbox image is fresh unless `--dry-run`
+11. execute Podman with the final argv-based inner command
 
-### 16.5 Candidate env mount
+## 12. Acceptance summary
 
-```rust
-pub struct EnvMountCandidate {
-    pub var_name: String,
-    pub host_path: PathBuf,
-}
-```
+The implementation is correct only if all of the following hold:
 
----
-
-## 17. Normative module responsibilities
-
-### `codex_config.rs`
-
-* parse `~/.codex/config.toml`
-* extract `sandbox_workspace_write.writable_roots`
-* ignore missing roots safely
-
-### `env_filter.rs`
-
-* load built-in ignore patterns
-* merge user-configured ignore-pattern extensions
-* filter environment variables
-* preserve current `PATH`
-
-### `env_mounts.rs`
-
-* detect path-like values in forwarded vars
-* resolve existing files/directories/sockets
-* reject home root
-* propose readonly candidates
-
-### `approval.rs`
-
-* load/save `~/.codexbox-conf.json`
-* prompt for new candidates
-* remember approvals
-
-### `certs.rs`
-
-* discover host certificate/trust paths
-* return readonly mount specs for existing paths
-
-### `launcher.rs`
-
-* assemble final mount plan
-* construct podman invocation
-* execute Codex automatically
-
----
-
-## 18. Acceptance criteria
-
-`codexbox` is acceptable only if all of the following are true.
-
-1. launching `codexbox` starts `codex --dangerously-bypass-approvals-and-sandbox`
-2. `~/.codex` is mounted read-write
-3. `~/.gitconfig` is mounted read-only if present
-4. `~/.config/gh` is mounted read-only if present
-5. `~/.config/glab-cli` is mounted read-only if present
-6. existing paths from `sandbox_workspace_write.writable_roots` are mounted read-write
-7. missing writable roots do not break launch
-8. environment variables matched by the built-in or user-configured ignore patterns are excluded
-9. `PATH` from the invoking shell is forwarded
-10. env-var-referenced existing file, directory, and socket paths are detected as readonly mount candidates
-11. unapproved env-var-derived mounts trigger a one-time interactive approval prompt
-12. approved env-var-derived mounts are persisted in `~/.codexbox-conf.json`
-13. the home directory root itself is never added as an env-var-derived bind mount
-14. host CA trust-store paths are mounted read-only
-15. Podman images built inside the sandbox are visible in the user’s normal Podman storage outside the sandbox
-16. files written on writable host mounts remain owned by the invoking user
-
----
-
-## 19. Recommended MVP order
-
-Best implementation order:
-
-1. Podman launcher
-2. fixed mounts
-3. Codex auto-launch
-4. parse `~/.codex/config.toml`
-5. writable roots support with missing-path skipping
-6. environment forwarding + ignore list
-7. env-var-derived readonly candidate detection
-8. approval DB and prompt
-9. CA trust-store discovery
-10. Podman persistence
-
----
-
-## 20. Explicit behavioral summary
-
-These are mandatory and non-negotiable in the implementation:
-
-* **always launch Codex automatically**
-* **always map `~/.codex`**
-* **always try to map `~/.gitconfig`, `~/.config/gh`, `~/.config/glab-cli` when present**
-* **read writable roots from `~/.codex/config.toml`**
-* **skip missing writable roots**
-* **forward shell env except ignored vars**
-* **forward current `PATH`**
-* **derive readonly mounts from forwarded env vars when they reference existing files/dirs/sockets**
-* **prompt once for new env-derived mounts**
-* **persist approvals in `~/.codexbox-conf.json`**
-* **never mount the home root itself from env-derived discovery**
-* **reuse host CA trust store readonly**
-* **preserve user-owned writes**
-* **persist Podman images to the user’s real rootless Podman storage**
+- `codexbox` launches Codex automatically by default
+- the binary works without repo-local config files or bundled runtime sidecar files
+- `~/.codexbox-conf.json` is the only persisted `codexbox` config file
+- per-directory config affects only `publish` and `add_dirs`
+- env-derived approvals are stored globally in `approved_paths`
+- `--dry-run` is side-effect free
+- env-derived discovery ignores URL-like values containing `://`
+- the sandbox image is rebuilt only when necessary or explicitly requested
