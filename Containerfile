@@ -32,9 +32,6 @@ RUN dnf -y makecache && \
     dnf -y install $INSTALL_RPMS --exclude container-selinux && \
     npm install -g @openai/codex@latest basedpyright@$BASEDPYRIGHT_NPM_VERSION && \
     dnf clean all && \
-    if test -n "$SOURCE_DATE_EPOCH" ; then \
-        sqlite3 /usr/lib/sysimage/libdnf5/transaction_history.sqlite "UPDATE trans SET dt_begin=$SOURCE_DATE_EPOCH, dt_end=$SOURCE_DATE_EPOCH; PRAGMA journal_mode=DELETE; PRAGMA journal_mode=WAL" ; \
-    fi && \
     rm -fv /etc/machine-id /var/lib/systemd/random-seed /var/lib/dnf/repos/*/countme && \
     rm -fv /usr/lib/systemd/profile.d/* && \
     rm -rf /var/cache /var/log/dnf* /var/log/hawkey.log /var/log/yum.*
