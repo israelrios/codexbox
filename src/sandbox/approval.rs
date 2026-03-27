@@ -49,9 +49,19 @@ pub fn approved_candidates(
     approved_paths: &BTreeSet<PathBuf>,
     approved_socket_vars: &BTreeSet<String>,
 ) -> Vec<EnvMountCandidate> {
+    let fully_approved_socket_paths =
+        fully_approved_socket_paths(&candidates, approved_paths, approved_socket_vars);
+
     candidates
         .into_iter()
-        .filter(|candidate| candidate_is_approved(candidate, approved_paths, approved_socket_vars))
+        .filter(|candidate| {
+            candidate_is_fully_approved(
+                candidate,
+                approved_paths,
+                approved_socket_vars,
+                &fully_approved_socket_paths,
+            )
+        })
         .collect()
 }
 
@@ -63,28 +73,39 @@ pub fn approve_candidates<P: ApprovalPrompt>(
     config_path: &Path,
     prompt: &mut P,
 ) -> Result<Vec<EnvMountCandidate>> {
-    let mut approved = Vec::new();
+    let mut approved_paths = approved_paths.clone();
+    let mut approved_socket_vars = approved_socket_vars.clone();
+    let mut all_candidates = Vec::new();
+    let mut individually_approved = Vec::new();
     let mut changed = false;
 
     for candidate in candidates {
+        all_candidates.push(candidate.clone());
+
         if candidate.is_socket()
             && !approved_socket_vars.contains(&candidate.var_name)
             && approved_paths.contains(&candidate.host_path)
         {
+            approved_socket_vars.insert(candidate.var_name.clone());
             changed |= user_config
                 .approved_socket_vars
                 .insert(candidate.var_name.clone());
-            approved.push(candidate);
+            individually_approved.push(candidate);
             continue;
         }
-        if candidate_is_approved(&candidate, approved_paths, approved_socket_vars) {
-            approved.push(candidate);
+        if candidate_has_individual_approval(&candidate, &approved_paths, &approved_socket_vars) {
+            individually_approved.push(candidate);
             continue;
         }
 
         if prompt.confirm(&candidate)? {
             changed |= persist_candidate_approval(&candidate, user_config);
-            approved.push(candidate);
+            if candidate.is_socket() {
+                approved_socket_vars.insert(candidate.var_name.clone());
+            } else {
+                approved_paths.insert(candidate.host_path.clone());
+            }
+            individually_approved.push(candidate);
         }
     }
 
@@ -92,10 +113,23 @@ pub fn approve_candidates<P: ApprovalPrompt>(
         save_user_config(config_path, user_config)?;
     }
 
-    Ok(approved)
+    let fully_approved_socket_paths =
+        fully_approved_socket_paths(&all_candidates, &approved_paths, &approved_socket_vars);
+
+    Ok(individually_approved
+        .into_iter()
+        .filter(|candidate| {
+            candidate_is_fully_approved(
+                candidate,
+                &approved_paths,
+                &approved_socket_vars,
+                &fully_approved_socket_paths,
+            )
+        })
+        .collect())
 }
 
-fn candidate_is_approved(
+fn candidate_has_individual_approval(
     candidate: &EnvMountCandidate,
     approved_paths: &BTreeSet<PathBuf>,
     approved_socket_vars: &BTreeSet<String>,
@@ -106,6 +140,51 @@ fn candidate_is_approved(
     } else {
         approved_paths.contains(&candidate.host_path)
     }
+}
+
+fn candidate_is_fully_approved(
+    candidate: &EnvMountCandidate,
+    approved_paths: &BTreeSet<PathBuf>,
+    approved_socket_vars: &BTreeSet<String>,
+    fully_approved_socket_paths: &BTreeSet<PathBuf>,
+) -> bool {
+    if candidate.is_socket() {
+        candidate_has_individual_approval(candidate, approved_paths, approved_socket_vars)
+            && fully_approved_socket_paths.contains(&candidate.host_path)
+    } else {
+        approved_paths.contains(&candidate.host_path)
+    }
+}
+
+fn fully_approved_socket_paths(
+    candidates: &[EnvMountCandidate],
+    approved_paths: &BTreeSet<PathBuf>,
+    approved_socket_vars: &BTreeSet<String>,
+) -> BTreeSet<PathBuf> {
+    let mut socket_paths = BTreeSet::new();
+
+    for candidate in candidates {
+        if !candidate.is_socket() {
+            continue;
+        }
+
+        if candidates
+            .iter()
+            .filter(|other| other.is_socket())
+            .all(|other| {
+                other.host_path != candidate.host_path
+                    || candidate_has_individual_approval(
+                        other,
+                        approved_paths,
+                        approved_socket_vars,
+                    )
+            })
+        {
+            socket_paths.insert(candidate.host_path.clone());
+        }
+    }
+
+    socket_paths
 }
 
 fn persist_candidate_approval(candidate: &EnvMountCandidate, user_config: &mut UserConfig) -> bool {
@@ -248,5 +327,67 @@ mod tests {
 
         assert_eq!(approved, vec![candidate]);
         assert!(saved.approved_socket_vars.contains("SSH_AUTH_SOCK"));
+    }
+
+    #[test]
+    fn approved_candidates_require_all_socket_aliases_to_be_approved() {
+        let host_path = PathBuf::from("/tmp/agent.sock");
+
+        let approved = approved_candidates(
+            vec![
+                EnvMountCandidate {
+                    var_name: "A_SOCK".into(),
+                    host_path: host_path.clone(),
+                    kind: EnvMountKind::Socket,
+                },
+                EnvMountCandidate {
+                    var_name: "B_SOCK".into(),
+                    host_path,
+                    kind: EnvMountKind::Socket,
+                },
+            ],
+            &BTreeSet::new(),
+            &BTreeSet::from(["A_SOCK".to_string()]),
+        );
+
+        assert!(approved.is_empty());
+    }
+
+    #[test]
+    fn approve_candidates_require_all_socket_aliases_before_mounting() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("codexbox-conf.json");
+        let host_path = dir.path().join("sock");
+        let candidates = vec![
+            EnvMountCandidate {
+                var_name: "A_SOCK".into(),
+                host_path: host_path.clone(),
+                kind: EnvMountKind::Socket,
+            },
+            EnvMountCandidate {
+                var_name: "B_SOCK".into(),
+                host_path,
+                kind: EnvMountKind::Socket,
+            },
+        ];
+        let mut user_config = UserConfig::default();
+        let mut prompt = FixedPrompt {
+            answers: RefCell::new(vec![true, false]),
+        };
+
+        let approved = approve_candidates(
+            candidates,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &mut user_config,
+            &config_path,
+            &mut prompt,
+        )
+        .unwrap();
+        let saved = load_user_config(&config_path).unwrap();
+
+        assert!(approved.is_empty());
+        assert!(saved.approved_socket_vars.contains("A_SOCK"));
+        assert!(!saved.approved_socket_vars.contains("B_SOCK"));
     }
 }
