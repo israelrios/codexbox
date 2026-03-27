@@ -43,8 +43,9 @@ fi
 
 mkdir -p "$XDG_RUNTIME_DIR/podman"
 chmod 700 "$XDG_RUNTIME_DIR"
-mkdir -p /var/run
-ln -snf "$XDG_RUNTIME_DIR/podman/podman.sock" /var/run/docker.sock
+if mkdir -p /var/run 2>/dev/null; then
+    ln -snf "$XDG_RUNTIME_DIR/podman/podman.sock" /var/run/docker.sock 2>/dev/null || true
+fi
 
 podman system service --time=0 "$DOCKER_HOST" &
 service_pid=$!
