@@ -210,7 +210,8 @@ Requirements:
 
 - use rootless Podman
 - keep the runtime image build context embedded in the binary
-- rebuild the sandbox image when it is missing, when its embedded-asset fingerprint is stale, when the existing image is older than 7 days, or when `--rebuild-image` is set
+- rebuild the sandbox image when it is missing, when its embedded-asset fingerprint is stale, when the existing image is
+  older than 7 days, or when `--rebuild-image` is set
 - install the latest available `@openai/codex` npm package whenever the sandbox image is rebuilt
 - avoid rebuilding when the current image fingerprint already matches
 - keep Podman-created images available in the user environment outside the sandbox

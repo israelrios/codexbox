@@ -179,7 +179,10 @@ exit 0
         .unwrap();
 
     assert!(output.status.success());
-    assert_eq!(fs::read_link(home_dir.join(".bashrc")).unwrap(), PathBuf::from("/root/.bashrc"));
+    assert_eq!(
+        fs::read_link(home_dir.join(".bashrc")).unwrap(),
+        PathBuf::from("/root/.bashrc")
+    );
     assert_eq!(
         fs::read_to_string(home_dir.join(".bash_profile")).unwrap(),
         "existing profile"
