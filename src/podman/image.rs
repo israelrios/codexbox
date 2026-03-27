@@ -1,6 +1,8 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::fd::BorrowedFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
@@ -83,6 +85,7 @@ pub fn ensure_image(image: &str, rebuild: bool) -> Result<()> {
 fn build_image(image: &str, fingerprint: &str) -> Result<()> {
     let context = EmbeddedBuildContext::create()?;
     let built_at = current_unix_timestamp()?;
+    let progress_output = stderr_stdio().map_err(CodexboxError::PodmanSpawn)?;
 
     let status = Command::new("podman")
         .arg("build")
@@ -97,6 +100,8 @@ fn build_image(image: &str, fingerprint: &str) -> Result<()> {
         .arg("--file")
         .arg(context.containerfile_path())
         .arg(context.path())
+        .stdout(progress_output)
+        .stderr(Stdio::inherit())
         .status()
         .map_err(CodexboxError::PodmanSpawn)?;
 
@@ -175,6 +180,20 @@ fn current_unix_timestamp() -> Result<u64> {
         })
 }
 
+fn stderr_stdio() -> std::io::Result<Stdio> {
+    #[cfg(unix)]
+    {
+        // SAFETY: file descriptor 2 is the process stderr stream for the lifetime of the process.
+        let stderr = unsafe { BorrowedFd::borrow_raw(2) };
+        stderr.try_clone_to_owned().map(Stdio::from)
+    }
+
+    #[cfg(not(unix))]
+    {
+        Ok(Stdio::inherit())
+    }
+}
+
 fn write_embedded_asset(path: PathBuf, contents: &[u8]) -> Result<()> {
     fs::write(&path, contents).map_err(|source| CodexboxError::WritePath { path, source })
 }
@@ -235,10 +254,13 @@ pub fn import_exported_images(export_dir: &Path) -> Result<()> {
     archives.sort();
 
     for archive in archives {
+        let progress_output = stderr_stdio().map_err(CodexboxError::PodmanSpawn)?;
         let status = Command::new("podman")
             .arg("load")
             .arg("--input")
             .arg(&archive)
+            .stdout(progress_output)
+            .stderr(Stdio::inherit())
             .status()
             .map_err(CodexboxError::PodmanSpawn)?;
         if !status.success() {

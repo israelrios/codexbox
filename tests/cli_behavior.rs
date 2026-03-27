@@ -63,6 +63,24 @@ if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
     exit 0
 fi
 
+if [ "$1" = "build" ]; then
+    printf '%s' "${CODEXBOX_TEST_PODMAN_BUILD_STDOUT:-}"
+    printf '%s' "${CODEXBOX_TEST_PODMAN_BUILD_STDERR:-}" >&2
+    exit 0
+fi
+
+if [ "$1" = "load" ]; then
+    printf '%s' "${CODEXBOX_TEST_PODMAN_LOAD_STDOUT:-}"
+    printf '%s' "${CODEXBOX_TEST_PODMAN_LOAD_STDERR:-}" >&2
+    exit 0
+fi
+
+if [ "$1" = "run" ]; then
+    printf '%s' "${CODEXBOX_TEST_PODMAN_RUN_STDOUT:-}"
+    printf '%s' "${CODEXBOX_TEST_PODMAN_RUN_STDERR:-}" >&2
+    exit 0
+fi
+
 exit 0
 "#,
     )
@@ -313,6 +331,48 @@ fn stale_image_triggers_rebuild() {
     assert!(log.contains("ARGS:[image][inspect]"));
     assert!(log.contains("ARGS:[build]"));
     assert!(log.contains("[--isolation][chroot]"));
+}
+
+#[test]
+fn rebuild_keeps_podman_build_stdout_out_of_command_stdout() {
+    let dir = tempdir().unwrap();
+    let home_dir = dir.path().join("home");
+    let workspace = dir.path().join("workspace");
+    let fake_bin = dir.path().join("fake-bin");
+    let podman_log = dir.path().join("podman.log");
+    fs::create_dir_all(&home_dir).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_fake_podman(&fake_bin.join("podman"));
+
+    let path = format!("{}:/usr/bin:/bin", fake_bin.display());
+    let output = Command::new(codexbox_bin())
+        .arg("--container-command")
+        .arg("printf")
+        .arg("smoke")
+        .current_dir(&workspace)
+        .env_clear()
+        .env("HOME", &home_dir)
+        .env("PATH", path)
+        .env("LANG", "C.UTF-8")
+        .env("CODEXBOX_TEST_PODMAN_LOG", &podman_log)
+        .env(
+            "CODEXBOX_TEST_IMAGE_INSPECT_RESPONSE",
+            format!("{}|0", embedded_image_fingerprint()),
+        )
+        .env("CODEXBOX_TEST_PODMAN_BUILD_STDOUT", "build noise\n")
+        .env("CODEXBOX_TEST_PODMAN_RUN_STDOUT", "smoke")
+        .output()
+        .unwrap();
+    let log = fs::read_to_string(&podman_log).unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(stdout, "smoke");
+    assert!(stderr.contains("build noise"));
+    assert!(log.contains("ARGS:[build]"));
+    assert!(log.contains("ARGS:[run]"));
 }
 
 #[test]
