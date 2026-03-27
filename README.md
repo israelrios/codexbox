@@ -30,6 +30,18 @@ host mounts, environment variables, certificates, and nested container tooling.
 cargo build
 ```
 
+Install a release build to `~/.local/bin`:
+
+```bash
+./install.sh
+```
+
+Equivalent Cargo command:
+
+```bash
+cargo install --path . --locked --force --root ~/.local
+```
+
 ## Run
 
 Launch Codex in the sandbox:
