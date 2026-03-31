@@ -15,7 +15,7 @@ use crate::sandbox::approval::{approve_candidates, approved_candidates, StdioApp
 use crate::sandbox::env_filter::{filter_environment, ForwardedEnv};
 use crate::sandbox::env_mounts::{discover_env_mount_candidates, EnvMountCandidate};
 use crate::sandbox::mounts::{
-    approved_env_mounts, base_mounts, ca_mounts, combine_mounts, discover_ca_trust_paths,
+    approved_env_mounts, base_mounts, combine_mounts, discover_ca_trust_mounts,
     filter_covered_env_candidates, has_ssh_known_hosts_mount, mount_covers_path,
     prepare_runtime_dirs, MountMode, MountSource, MountSpec, GUEST_SSH_KNOWN_HOSTS_SEED,
 };
@@ -88,7 +88,7 @@ pub fn launch(cli: Cli) -> Result<i32> {
     let publish = merge_publish(&config.effective_config.publish, publish);
     let command = container_command.unwrap_or(add_dir_plan.command);
     let export_guest_dir = PathBuf::from("/var/lib/codexbox-image-exports");
-    let ca_paths = discover_ca_trust_paths();
+    let ca_mounts = discover_ca_trust_mounts();
 
     if dry_run {
         let plan = build_plan(PlanRequest {
@@ -98,7 +98,7 @@ pub fn launch(cli: Cli) -> Result<i32> {
             filtered_env,
             base_mounts,
             approved_candidates: &approved_candidates,
-            ca_paths: &ca_paths,
+            ca_mounts: &ca_mounts,
             export_host_dir: dry_run_image_export_dir(&user),
             export_guest_dir,
             command,
@@ -119,7 +119,7 @@ pub fn launch(cli: Cli) -> Result<i32> {
         filtered_env,
         base_mounts,
         approved_candidates: &approved_candidates,
-        ca_paths: &ca_paths,
+        ca_mounts: &ca_mounts,
         export_host_dir: export_host_dir.path().to_path_buf(),
         export_guest_dir: PathBuf::from("/var/lib/codexbox-image-exports"),
         command,
@@ -139,7 +139,7 @@ struct PlanRequest<'a> {
     filtered_env: ForwardedEnv,
     base_mounts: Vec<MountSpec>,
     approved_candidates: &'a [EnvMountCandidate],
-    ca_paths: &'a [PathBuf],
+    ca_mounts: &'a [MountSpec],
     export_host_dir: PathBuf,
     export_guest_dir: PathBuf,
     command: Vec<String>,
@@ -151,7 +151,7 @@ fn build_plan(request: PlanRequest<'_>) -> PodmanPlan {
     let mut mounts = combine_mounts(&[
         request.base_mounts,
         approved_env_mounts(request.approved_candidates),
-        ca_mounts(request.ca_paths),
+        request.ca_mounts.to_vec(),
         vec![MountSpec {
             host: request.export_host_dir,
             guest: request.export_guest_dir.clone(),
@@ -327,7 +327,7 @@ mod tests {
             filtered_env: ForwardedEnv::default(),
             base_mounts,
             approved_candidates: &[],
-            ca_paths: &[],
+            ca_mounts: &[],
             export_host_dir: dir.path().join("exports"),
             export_guest_dir: PathBuf::from("/var/lib/codexbox-image-exports"),
             command: vec!["codex".into()],

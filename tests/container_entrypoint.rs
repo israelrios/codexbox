@@ -304,14 +304,21 @@ exit 0
 fn entrypoint_links_root_bash_init_files_when_missing() {
     let dir = tempdir().unwrap();
     let fake_bin = dir.path().join("fake-bin");
+    let guest_containers_dir = dir.path().join("guest-containers");
     let home_dir = dir.path().join("home");
     let runtime_dir = dir.path().join("runtime");
     let socket_dir = runtime_dir.join("podman");
     fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(&guest_containers_dir).unwrap();
     fs::create_dir_all(&home_dir).unwrap();
     fs::create_dir_all(&socket_dir).unwrap();
     let _socket = symlink_socket_fixture(&socket_dir.join("podman.sock"));
 
+    fs::write(
+        guest_containers_dir.join("containers.conf"),
+        "[containers]\n",
+    )
+    .unwrap();
     fs::write(home_dir.join(".bash_profile"), "existing profile").unwrap();
 
     write_fake_podman(
@@ -333,10 +340,15 @@ exit 0
         .env("HOME", &home_dir)
         .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
         .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("CODEXBOX_GUEST_CONTAINERS_DIR", &guest_containers_dir)
         .output()
         .unwrap();
 
     assert!(output.status.success());
+    assert_eq!(
+        fs::read_link(home_dir.join(".config/containers")).unwrap(),
+        guest_containers_dir
+    );
     assert_eq!(
         fs::read_link(home_dir.join(".bashrc")).unwrap(),
         PathBuf::from("/root/.bashrc")
@@ -344,5 +356,74 @@ exit 0
     assert_eq!(
         fs::read_to_string(home_dir.join(".bash_profile")).unwrap(),
         "existing profile"
+    );
+}
+
+#[test]
+fn entrypoint_merges_guest_containers_config_into_existing_home_dir() {
+    let dir = tempdir().unwrap();
+    let fake_bin = dir.path().join("fake-bin");
+    let guest_containers_dir = dir.path().join("guest-containers");
+    let home_dir = dir.path().join("home");
+    let runtime_dir = dir.path().join("runtime");
+    let socket_dir = runtime_dir.join("podman");
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(guest_containers_dir.join("certs.d/registry.example")).unwrap();
+    fs::create_dir_all(home_dir.join(".config/containers")).unwrap();
+    fs::create_dir_all(&socket_dir).unwrap();
+    let _socket = symlink_socket_fixture(&socket_dir.join("podman.sock"));
+
+    fs::write(
+        guest_containers_dir.join("containers.conf"),
+        "[containers]\nlog_driver=\"k8s-file\"\n",
+    )
+    .unwrap();
+    fs::write(
+        guest_containers_dir.join("certs.d/registry.example/ca.crt"),
+        "guest-ca",
+    )
+    .unwrap();
+    fs::write(
+        home_dir.join(".config/containers/auth.json"),
+        "{\"auths\":{\"registry.example\":{}}}\n",
+    )
+    .unwrap();
+
+    write_fake_podman(
+        &fake_bin.join("podman"),
+        r#"#!/bin/sh
+if [ "$1" = "system" ] && [ "$2" = "service" ]; then
+    exit 0
+fi
+exit 0
+"#,
+    );
+
+    let output = Command::new("/bin/sh")
+        .arg(entrypoint_path())
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("true")
+        .env_clear()
+        .env("HOME", &home_dir)
+        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("CODEXBOX_GUEST_CONTAINERS_DIR", &guest_containers_dir)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(home_dir.join(".config/containers/auth.json")).unwrap(),
+        "{\"auths\":{\"registry.example\":{}}}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(home_dir.join(".config/containers/containers.conf")).unwrap(),
+        "[containers]\nlog_driver=\"k8s-file\"\n"
+    );
+    assert_eq!(
+        fs::read_to_string(home_dir.join(".config/containers/certs.d/registry.example/ca.crt"))
+            .unwrap(),
+        "guest-ca"
     );
 }

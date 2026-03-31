@@ -147,6 +147,8 @@ The launcher must mount these read-only when present:
 - `~/.config/gh`
 - `~/.config/glab-cli`
 - `/etc/docker`
+- registry trust/auth sources needed by Docker- or Podman-configured hosts, such as `/etc/docker/certs.d`,
+  `/etc/containers/certs.d`, `~/.docker/config.json`, and `~/.config/containers/auth.json`
 - `~/.ssh/known_hosts` as a seed file for an ephemeral in-container copy
 - approved env-derived paths
 - discovered host CA trust paths
@@ -202,12 +204,14 @@ The launcher must reuse the host CA trust store by bind-mounting known host cert
 Typical probe targets include:
 
 - `/etc/ssl/certs`
+- `/etc/ssl/certs/ca-certificates.crt`
 - `/etc/pki/tls/certs`
 - `/etc/ca-certificates`
 - `/etc/ssl/cert.pem`
 - `/etc/pki/ca-trust`
 
-Only existing paths are mounted.
+Only existing host paths are mounted. When the host bundle path differs from the guest distro default,
+the launcher may bind-mount the host CA bundle onto the guest's equivalent bundle path.
 
 ## 10. Podman behavior
 

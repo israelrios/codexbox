@@ -120,6 +120,11 @@ cargo run -- --container-command podman info
   container home directory at startup so SSH can append ephemeral host keys without modifying the host file.
 - If `/etc/docker` exists on the host, `codexbox` bind-mounts it read-only so Docker-compatible tooling inside the
   sandbox can reuse host daemon and cert configuration.
+- For registry compatibility, `codexbox` also maps host registry cert and auth sources such as `/etc/docker/certs.d`,
+  `/etc/containers/certs.d`, `~/.docker/config.json`, and `~/.config/containers/auth.json` into guest locations that
+  Fedora Podman actually reads.
+- `codexbox` also reuses host CA trust paths, including distro-specific bundle files such as
+  `/etc/ssl/certs/ca-certificates.crt`, and can map them onto the guest distro's expected bundle path.
 - If a forwarded environment variable points at an existing host directory, file, or Unix socket, `codexbox` creates a
   matching bind mount for that path.
 - Env vars whose values contain `://` are treated as URLs and never scanned for mount candidates.

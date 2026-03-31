@@ -13,6 +13,32 @@ if [ "${CODEXBOX_PATH_PREFIX+x}" = x ]; then
     export PATH="${CODEXBOX_PATH_PREFIX}:$PATH"
 fi
 
+merge_missing_tree() {
+    src_dir=$1
+    dest_dir=$2
+
+    [ -d "$src_dir" ] || return 0
+    mkdir -p "$dest_dir"
+
+    (
+        cd "$src_dir" || exit 1
+        find . -mindepth 1 -print
+    ) | while IFS= read -r rel_path; do
+        src_path="$src_dir/$rel_path"
+        dest_path="$dest_dir/$rel_path"
+
+        if [ -d "$src_path" ]; then
+            mkdir -p "$dest_path" 2>/dev/null || true
+            continue
+        fi
+
+        if [ ! -e "$dest_path" ] && [ ! -L "$dest_path" ]; then
+            mkdir -p "$(dirname "$dest_path")" 2>/dev/null || true
+            cp -p "$src_path" "$dest_path" 2>/dev/null || cp "$src_path" "$dest_path" 2>/dev/null || true
+        fi
+    done
+}
+
 if [ "${CODEXBOX_SSH_KNOWN_HOSTS_SEED:-}" != "" ] && [ -f "$CODEXBOX_SSH_KNOWN_HOSTS_SEED" ]; then
     ssh_dir="${HOME:-/root}/.ssh"
     known_hosts_path="$ssh_dir/known_hosts"
@@ -26,9 +52,12 @@ fi
 if [ "${HOME:-}" != "" ] && [ "$HOME" != "/root" ]; then
     home_config_dir="$HOME/.config"
     home_containers_dir="$home_config_dir/containers"
+    : "${CODEXBOX_GUEST_CONTAINERS_DIR:=/root/.config/containers}"
     mkdir -p "$home_config_dir"
     if [ -L "$home_containers_dir" ] || [ ! -e "$home_containers_dir" ]; then
-        ln -snf /root/.config/containers "$home_containers_dir"
+        ln -snf "$CODEXBOX_GUEST_CONTAINERS_DIR" "$home_containers_dir"
+    elif [ -d "$home_containers_dir" ]; then
+        merge_missing_tree "$CODEXBOX_GUEST_CONTAINERS_DIR" "$home_containers_dir"
     fi
 
     for shell_init in .bashrc .bash_profile; do
