@@ -16,6 +16,13 @@ pub struct Cli {
     #[arg(long, help = "Rebuild the sandbox image before launch")]
     pub rebuild_image: bool,
 
+    #[arg(
+        long,
+        help = "Rebuild the sandbox image and exit",
+        conflicts_with_all = ["dry_run", "publish", "container_command", "codex_args"]
+    )]
+    pub rebuild_image_only: bool,
+
     #[arg(long, help = "Print the final podman run command and exit")]
     pub dry_run: bool,
 
@@ -43,4 +50,29 @@ pub struct Cli {
         help = "Extra arguments forwarded to codex"
     )]
     pub codex_args: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Cli;
+
+    #[test]
+    fn rebuild_image_only_conflicts_with_dry_run() {
+        assert!(Cli::try_parse_from(["codexbox", "--rebuild-image-only", "--dry-run"]).is_err());
+    }
+
+    #[test]
+    fn rebuild_image_only_accepts_custom_image() {
+        let cli = Cli::parse_from([
+            "codexbox",
+            "--image",
+            "localhost/codexbox:test",
+            "--rebuild-image-only",
+        ]);
+
+        assert_eq!(cli.image.as_deref(), Some("localhost/codexbox:test"));
+        assert!(cli.rebuild_image_only);
+    }
 }

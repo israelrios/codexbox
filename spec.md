@@ -25,6 +25,7 @@ codex --dangerously-bypass-approvals-and-sandbox [CODEx_ARGS...]
 - `--container-command <argv...>` replaces the default inner command with an argv vector.
 - The inner command model is argv-based only. No shell-string command channel is supported.
 - `--dry-run` prints the final `podman run` command and exits without mutating host state.
+- `--rebuild-image-only` rebuilds the sandbox image and exits without starting the container.
 
 `--dry-run` must not:
 
@@ -232,6 +233,8 @@ The sandbox must support Docker-compatible workflows through Podman.
 ## 11. Effective startup flow
 
 Normative flow:
+
+If `--rebuild-image-only` is set, rebuild the selected image and exit before user-context detection or sandbox setup.
 
 1. detect user context and current working directory
 2. load `~/.codexbox-conf.json` and compute effective directory overrides

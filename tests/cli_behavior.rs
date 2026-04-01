@@ -446,6 +446,40 @@ fn rebuild_keeps_podman_build_stdout_out_of_command_stdout() {
 }
 
 #[test]
+fn rebuild_image_only_builds_and_exits_without_running_container() {
+    let dir = tempdir().unwrap();
+    let home_dir = dir.path().join("home");
+    let workspace = dir.path().join("workspace");
+    let fake_bin = dir.path().join("fake-bin");
+    let podman_log = dir.path().join("podman.log");
+    fs::create_dir_all(&home_dir).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_fake_podman(&fake_bin.join("podman"));
+
+    let path = format!("{}:/usr/bin:/bin", fake_bin.display());
+    let output = Command::new(codexbox_bin())
+        .arg("--rebuild-image-only")
+        .current_dir(&workspace)
+        .env_clear()
+        .env("HOME", &home_dir)
+        .env("PATH", path)
+        .env("LANG", "C.UTF-8")
+        .env("CODEXBOX_TEST_PODMAN_LOG", &podman_log)
+        .output()
+        .unwrap();
+    let log = fs::read_to_string(&podman_log).unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+    assert!(log.contains("ARGS:[--cgroup-manager][cgroupfs][build]"));
+    assert!(!log.contains("ARGS:[image][inspect]"));
+    assert!(!log.contains("ARGS:[run]"));
+    assert!(!home_dir.join(".codex").exists());
+    assert!(!home_dir.join(".local/share/codexbox/containers").exists());
+}
+
+#[test]
 fn run_uses_argv_container_command_without_shell_env_channel() {
     let dir = tempdir().unwrap();
     let home_dir = dir.path().join("home");

@@ -44,11 +44,19 @@ pub fn launch(cli: Cli) -> Result<i32> {
     let Cli {
         image,
         rebuild_image,
+        rebuild_image_only,
         dry_run,
         publish,
         container_command,
         codex_args,
     } = cli;
+
+    let image = image.unwrap_or_else(|| DEFAULT_IMAGE.to_string());
+
+    if rebuild_image_only {
+        ensure_image(&image, true)?;
+        return Ok(0);
+    }
 
     let user = UserContext::detect()?;
     let mut config = load_launcher_config(&user)?;
@@ -84,7 +92,6 @@ pub fn launch(cli: Cli) -> Result<i32> {
         )?
     };
 
-    let image = image.unwrap_or_else(|| DEFAULT_IMAGE.to_string());
     let publish = merge_publish(&config.effective_config.publish, publish);
     let command = container_command.unwrap_or(add_dir_plan.command);
     let export_guest_dir = PathBuf::from("/var/lib/codexbox-image-exports");

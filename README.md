@@ -62,6 +62,12 @@ Force a rebuild of the embedded image before launch:
 cargo run -- --rebuild-image
 ```
 
+Rebuild the embedded image and exit without launching Codex:
+
+```bash
+cargo run -- --rebuild-image-only
+```
+
 Publish one or more ports with Podman syntax:
 
 ```bash
