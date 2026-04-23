@@ -132,13 +132,16 @@ Rules for `writable_roots`:
 
 The launcher must provide writable mounts for:
 
-- the current working directory
+- the current working directory, except when it is exactly the user's home directory
 - `~/.codex`
 - existing `writable_roots` from `~/.codex/config.toml`
 - valid directories from CLI or config `add_dirs`
 - internal Podman persistence paths needed by `codexbox`
 
 `add_dirs` are mounted only when they resolve to existing directories.
+When the current working directory is the user's home directory, the launcher must emit a warning that explains the
+home directory will not be bind-mounted and instructs the user to run from a project directory or explicitly configure
+access with `--add-dir` or `writable_roots`.
 
 ### 6.2 Read-only mounts
 

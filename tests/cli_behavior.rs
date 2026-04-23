@@ -119,6 +119,27 @@ fn dry_run_does_not_create_runtime_state() {
 }
 
 #[test]
+fn dry_run_skips_mounting_home_when_cwd_is_home() {
+    let dir = tempdir().unwrap();
+    let home_dir = dir.path().join("home");
+    fs::create_dir_all(&home_dir).unwrap();
+
+    let output = run_codexbox(&home_dir, &home_dir, &["--dry-run"], &[]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(output.status.success());
+    assert!(stderr.contains(
+        "current working directory is your home directory; skipping the writable bind mount for HOME"
+    ));
+    assert!(!stdout.contains(&format!(
+        "src={},target={}",
+        home_dir.display(),
+        home_dir.display()
+    )));
+}
+
+#[test]
 fn user_config_supplies_defaults_and_repo_config_is_ignored() {
     let dir = tempdir().unwrap();
     let home_dir = dir.path().join("home");

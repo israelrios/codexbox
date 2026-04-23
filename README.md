@@ -109,6 +109,8 @@ User defaults can be defined in `~/.codexbox-conf.json`:
 - `directory_rules` applies extra `publish` and `add_dirs` entries when you launch `codexbox` from that directory or one
   of its descendants.
 - Configured `add_dirs` are mounted automatically and appended to the Codex invocation as `--add-dir` entries.
+- When you launch `codexbox` from your home directory, it warns and skips bind-mounting `$HOME` as the writable working
+  tree. Run it from a project directory or explicitly grant access with `--add-dir` or `writable_roots` when needed.
 
 CLI `-p/--publish` accepts `CONTAINER_PORT`, `HOST_PORT:CONTAINER_PORT`, or `HOST_IP:HOST_PORT:CONTAINER_PORT`, with
 optional `/udp`.

@@ -17,7 +17,8 @@ use crate::sandbox::env_mounts::{discover_env_mount_candidates, EnvMountCandidat
 use crate::sandbox::mounts::{
     approved_env_mounts, base_mounts, combine_mounts, discover_ca_trust_mounts,
     filter_covered_env_candidates, has_ssh_known_hosts_mount, mount_covers_path,
-    prepare_runtime_dirs, MountMode, MountSource, MountSpec, GUEST_SSH_KNOWN_HOSTS_SEED,
+    prepare_runtime_dirs, should_mount_cwd, MountMode, MountSource, MountSpec,
+    GUEST_SSH_KNOWN_HOSTS_SEED,
 };
 use crate::user_context::UserContext;
 
@@ -27,6 +28,11 @@ const SSH_KNOWN_HOSTS_SEED_ENV: &str = "CODEXBOX_SSH_KNOWN_HOSTS_SEED";
 enum KnownHostsPlan {
     Seed,
     Overlay(MountSpec),
+}
+
+struct RuntimeHomeContainersMount {
+    _tempdir: TempDir,
+    mount: MountSpec,
 }
 
 struct RuntimeKnownHostsMount {
@@ -63,12 +69,18 @@ pub fn launch(cli: Cli) -> Result<i32> {
     let filtered_env = filter_environment(&config.env_filter)?;
     let codex_config = load_codex_toml(&user.home_dir)?;
     let writable_roots = existing_writable_roots(&codex_config, &user.home_dir);
+    if !should_mount_cwd(&user) {
+        eprintln!(
+            "codexbox: warning: current working directory is your home directory; skipping the writable bind mount for HOME. Run codexbox from a project directory or configure the directories you need with --add-dir or writable_roots."
+        );
+    }
     let add_dir_plan =
         plan_default_codex_command(codex_args, &config.effective_config.add_dirs, &user);
     let base_mounts = combine_mounts(&[
         base_mounts(&user, &writable_roots)?,
         add_dir_mounts(&add_dir_plan.paths),
     ]);
+    let runtime_home_containers_mount = prepare_runtime_home_containers_mount(&user, &base_mounts)?;
     let runtime_known_hosts_mount = prepare_runtime_known_hosts_mount(&user, &base_mounts)?;
     let known_hosts_plan = plan_known_hosts_mount(&base_mounts, runtime_known_hosts_mount.as_ref());
     let env_candidates = discover_env_mount_candidates(&filtered_env, &user.home_dir);
@@ -110,6 +122,7 @@ pub fn launch(cli: Cli) -> Result<i32> {
             export_guest_dir,
             command,
             known_hosts_plan: known_hosts_plan.clone(),
+            runtime_home_containers_mount: runtime_home_containers_mount.as_ref(),
         });
         println!("{}", render_plan(&plan, &user));
         return Ok(0);
@@ -131,6 +144,7 @@ pub fn launch(cli: Cli) -> Result<i32> {
         export_guest_dir: PathBuf::from("/var/lib/codexbox-image-exports"),
         command,
         known_hosts_plan,
+        runtime_home_containers_mount: runtime_home_containers_mount.as_ref(),
     });
 
     let exit_code = run_plan(&plan, &user)?;
@@ -151,6 +165,7 @@ struct PlanRequest<'a> {
     export_guest_dir: PathBuf,
     command: Vec<String>,
     known_hosts_plan: Option<KnownHostsPlan>,
+    runtime_home_containers_mount: Option<&'a RuntimeHomeContainersMount>,
 }
 
 fn build_plan(request: PlanRequest<'_>) -> PodmanPlan {
@@ -182,6 +197,11 @@ fn build_plan(request: PlanRequest<'_>) -> PodmanPlan {
         None => {}
     }
 
+    if let Some(runtime_home_containers_mount) = request.runtime_home_containers_mount {
+        mounts.retain(|mount| mount.guest != runtime_home_containers_mount.mount.guest);
+        mounts.push(runtime_home_containers_mount.mount.clone());
+    }
+
     PodmanPlan {
         image: request.image,
         mounts,
@@ -192,6 +212,44 @@ fn build_plan(request: PlanRequest<'_>) -> PodmanPlan {
         home_dir: request.user.home_dir.clone(),
         workdir: request.user.cwd.clone(),
     }
+}
+
+fn prepare_runtime_home_containers_mount(
+    user: &UserContext,
+    mounts: &[MountSpec],
+) -> Result<Option<RuntimeHomeContainersMount>> {
+    let containers_dir = user.home_dir.join(".config").join("containers");
+    let covered_by_writable_mount = mounts.iter().any(|mount| {
+        mount.mode == MountMode::ReadWrite && mount_covers_path(mount, &containers_dir)
+    });
+    if !covered_by_writable_mount {
+        return Ok(None);
+    }
+
+    let temp_root = std::env::temp_dir();
+    let tempdir = tempfile::Builder::new()
+        .prefix("codexbox-home-containers-")
+        .tempdir_in(&temp_root)
+        .map_err(|source| CodexboxError::WritePath {
+            path: temp_root,
+            source,
+        })?;
+    let runtime_containers_dir = tempdir.path().join("containers");
+    copy_tree_if_exists(&containers_dir, &runtime_containers_dir)?;
+    fs::create_dir_all(&runtime_containers_dir).map_err(|source| CodexboxError::WritePath {
+        path: runtime_containers_dir.clone(),
+        source,
+    })?;
+
+    Ok(Some(RuntimeHomeContainersMount {
+        _tempdir: tempdir,
+        mount: MountSpec {
+            host: runtime_containers_dir,
+            guest: containers_dir,
+            mode: MountMode::ReadWrite,
+            source: MountSource::Fixed,
+        },
+    }))
 }
 
 fn prepare_runtime_known_hosts_mount(
@@ -235,6 +293,67 @@ fn prepare_runtime_known_hosts_mount(
     }))
 }
 
+fn copy_tree_if_exists(src: &Path, dst: &Path) -> Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+
+    let metadata = fs::symlink_metadata(src).map_err(|source| CodexboxError::ReadPath {
+        path: src.to_path_buf(),
+        source,
+    })?;
+
+    if metadata.is_dir() {
+        fs::create_dir_all(dst).map_err(|source| CodexboxError::WritePath {
+            path: dst.to_path_buf(),
+            source,
+        })?;
+
+        for entry in fs::read_dir(src).map_err(|source| CodexboxError::ReadPath {
+            path: src.to_path_buf(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| CodexboxError::ReadPath {
+                path: src.to_path_buf(),
+                source,
+            })?;
+            copy_tree_if_exists(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+
+        return Ok(());
+    }
+
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(src).map_err(|source| CodexboxError::ReadPath {
+            path: src.to_path_buf(),
+            source,
+        })?;
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent).map_err(|source| CodexboxError::WritePath {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        std::os::unix::fs::symlink(&target, dst).map_err(|source| CodexboxError::WritePath {
+            path: dst.to_path_buf(),
+            source,
+        })?;
+        return Ok(());
+    }
+
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|source| CodexboxError::WritePath {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    fs::copy(src, dst).map_err(|source| CodexboxError::WritePath {
+        path: dst.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
 fn plan_known_hosts_mount(
     base_mounts: &[MountSpec],
     runtime_known_hosts_mount: Option<&RuntimeKnownHostsMount>,
@@ -272,8 +391,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        build_plan, merge_publish, plan_known_hosts_mount, prepare_runtime_known_hosts_mount,
-        PlanRequest, SSH_KNOWN_HOSTS_SEED_ENV,
+        build_plan, merge_publish, plan_known_hosts_mount, prepare_runtime_home_containers_mount,
+        prepare_runtime_known_hosts_mount, PlanRequest, SSH_KNOWN_HOSTS_SEED_ENV,
     };
 
     #[test]
@@ -316,6 +435,8 @@ mod tests {
             cwd,
         };
         let base_mounts = base_mounts(&user, std::slice::from_ref(&home)).unwrap();
+        let runtime_home_containers_mount =
+            prepare_runtime_home_containers_mount(&user, &base_mounts).unwrap();
         let runtime_known_hosts_mount = prepare_runtime_known_hosts_mount(&user, &base_mounts)
             .unwrap()
             .unwrap();
@@ -339,6 +460,7 @@ mod tests {
             export_guest_dir: PathBuf::from("/var/lib/codexbox-image-exports"),
             command: vec!["codex".into()],
             known_hosts_plan,
+            runtime_home_containers_mount: runtime_home_containers_mount.as_ref(),
         });
 
         assert!(plan.mounts.iter().any(|mount| {
@@ -354,5 +476,67 @@ mod tests {
             .extra_env
             .iter()
             .any(|(key, _)| key == SSH_KNOWN_HOSTS_SEED_ENV));
+    }
+
+    #[test]
+    fn prepare_runtime_home_containers_mount_overlays_writable_host_config() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("workspace");
+        let host_containers_dir = home.join(".config/containers");
+        fs::create_dir_all(host_containers_dir.join("certs.d/example")).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(
+            host_containers_dir.join("containers.conf"),
+            "[containers]\nlog_driver = \"journald\"\n",
+        )
+        .unwrap();
+        fs::write(
+            host_containers_dir.join("certs.d/example/ca.crt"),
+            "host-ca",
+        )
+        .unwrap();
+
+        let user = UserContext {
+            uid: 1000,
+            gid: 1000,
+            home_dir: home.clone(),
+            cwd,
+        };
+        let base_mounts = base_mounts(&user, std::slice::from_ref(&home)).unwrap();
+
+        let runtime_home_containers_mount =
+            prepare_runtime_home_containers_mount(&user, &base_mounts)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(
+            runtime_home_containers_mount.mount.guest,
+            home.join(".config/containers")
+        );
+        assert_ne!(
+            runtime_home_containers_mount.mount.host,
+            home.join(".config/containers")
+        );
+        assert_eq!(
+            fs::read_to_string(
+                runtime_home_containers_mount
+                    .mount
+                    .host
+                    .join("containers.conf")
+            )
+            .unwrap(),
+            "[containers]\nlog_driver = \"journald\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                runtime_home_containers_mount
+                    .mount
+                    .host
+                    .join("certs.d/example/ca.crt")
+            )
+            .unwrap(),
+            "host-ca"
+        );
     }
 }

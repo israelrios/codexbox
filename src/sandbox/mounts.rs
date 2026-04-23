@@ -95,12 +95,14 @@ pub struct MountSpec {
 pub fn base_mounts(user: &UserContext, writable_roots: &[PathBuf]) -> Result<Vec<MountSpec>> {
     let mut mounts = Vec::new();
 
-    mounts.push(MountSpec {
-        host: user.cwd.clone(),
-        guest: user.cwd.clone(),
-        mode: MountMode::ReadWrite,
-        source: MountSource::Fixed,
-    });
+    if should_mount_cwd(user) {
+        mounts.push(MountSpec {
+            host: user.cwd.clone(),
+            guest: user.cwd.clone(),
+            mode: MountMode::ReadWrite,
+            source: MountSource::Fixed,
+        });
+    }
 
     let codex_dir = user.home_dir.join(".codex");
     mounts.push(MountSpec {
@@ -142,6 +144,10 @@ pub fn base_mounts(user: &UserContext, writable_roots: &[PathBuf]) -> Result<Vec
 
     mounts.extend(podman_persistence_mounts(user)?);
     Ok(dedupe_mounts(mounts))
+}
+
+pub fn should_mount_cwd(user: &UserContext) -> bool {
+    user.cwd != user.home_dir
 }
 
 pub fn has_ssh_known_hosts_mount(mounts: &[MountSpec]) -> bool {
@@ -467,7 +473,7 @@ mod tests {
     use super::{
         base_mounts, discover_ca_trust_mounts, discover_ca_trust_mounts_from_existing,
         existing_readonly_self_mounts, filter_covered_env_candidates, has_ssh_known_hosts_mount,
-        prepare_runtime_dirs, registry_mounts_from_existing, MountMode,
+        prepare_runtime_dirs, registry_mounts_from_existing, should_mount_cwd, MountMode,
         GUEST_ADDITIONAL_IMAGE_STORE, GUEST_CONTAINERS_CERTS_DIR, GUEST_PODMAN_ROOT,
         GUEST_ROOT_CONTAINERS_AUTH_FILE, GUEST_ROOT_CONTAINERS_CERTS_DIR,
         GUEST_SSH_KNOWN_HOSTS_SEED, HOST_CONTAINERS_CERTS_DIR, HOST_DOCKER_CERTS_DIR,
@@ -536,6 +542,27 @@ mod tests {
         assert!(!mounts
             .iter()
             .any(|mount| mount.host == home.join(".config/containers")));
+    }
+
+    #[test]
+    fn cwd_mount_is_skipped_when_cwd_is_home() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(home.join(".local/share/containers/storage")).unwrap();
+
+        let user = UserContext {
+            uid: 1000,
+            gid: 1000,
+            home_dir: home.clone(),
+            cwd: home.clone(),
+        };
+
+        assert!(!should_mount_cwd(&user));
+
+        let mounts = base_mounts(&user, &[]).unwrap();
+        assert!(!mounts
+            .iter()
+            .any(|mount| mount.host == home && mount.guest == Path::new(&user.cwd)));
     }
 
     #[test]
