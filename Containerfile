@@ -9,6 +9,7 @@ RUN echo -e "\n\n# Added during image build" >> /etc/dnf/dnf.conf && \
 
 ARG INSTALL_RPMS="podman podman-docker bubblewrap fuse-overlayfs slirp4netns passt openssh-clients openssl cpp git-core sqlite python3 python3-pip python3-pytest nodejs ripgrep jq gcc gcc-c++ make procps-ng gh glab ShellCheck python3-pyyaml unzip"
 ARG BASEDPYRIGHT_NPM_VERSION="1.38.4"
+ARG CODEX_NPM_REFRESH_TOKEN="static"
 
 # Don't include container-selinux and remove
 # directories used by dnf that are just taking
@@ -20,6 +21,7 @@ RUN dnf -y makecache && \
     dnf -y update && \
     rpm --setcaps shadow-utils 2>/dev/null && \
     dnf -y install $INSTALL_RPMS --exclude container-selinux && \
+    printf '%s\n' "$CODEX_NPM_REFRESH_TOKEN" >/dev/null && \
     npm install -g @openai/codex@latest basedpyright@$BASEDPYRIGHT_NPM_VERSION && \
     dnf clean all && \
     rm -fv /etc/machine-id /var/lib/systemd/random-seed /var/lib/dnf/repos/*/countme && \

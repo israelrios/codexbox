@@ -400,6 +400,7 @@ fn stale_image_triggers_rebuild() {
     assert!(output.status.success());
     assert!(log.contains("ARGS:[image][inspect]"));
     assert!(log.contains("ARGS:[--cgroup-manager][cgroupfs][build]"));
+    assert!(log.contains("[--build-arg][CODEX_NPM_REFRESH_TOKEN="));
     assert!(!log.contains("[--isolation][chroot]"));
 }
 
@@ -442,6 +443,7 @@ fn rebuild_keeps_podman_build_stdout_out_of_command_stdout() {
     assert_eq!(stdout, "smoke");
     assert!(stderr.contains("build noise"));
     assert!(log.contains("ARGS:[--cgroup-manager][cgroupfs][build]"));
+    assert!(log.contains("[--build-arg][CODEX_NPM_REFRESH_TOKEN="));
     assert!(log.contains("ARGS:[run]"));
 }
 
@@ -473,6 +475,7 @@ fn rebuild_image_only_builds_and_exits_without_running_container() {
     assert!(output.status.success());
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
     assert!(log.contains("ARGS:[--cgroup-manager][cgroupfs][build]"));
+    assert!(log.contains("[--build-arg][CODEX_NPM_REFRESH_TOKEN="));
     assert!(!log.contains("ARGS:[image][inspect]"));
     assert!(!log.contains("ARGS:[run]"));
     assert!(!home_dir.join(".codex").exists());

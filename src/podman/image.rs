@@ -20,6 +20,7 @@ pub const DEFAULT_IMAGE: &str = "localhost/codexbox:latest";
 const IMAGE_EXPORT_DIR_ENV: &str = "CODEXBOX_IMAGE_EXPORT_DIR";
 const IMAGE_FINGERPRINT_LABEL: &str = "io.github.codexbox.image-fingerprint";
 const IMAGE_BUILT_AT_LABEL: &str = "io.github.codexbox.image-built-at";
+const CODEX_NPM_REFRESH_TOKEN_ARG: &str = "CODEX_NPM_REFRESH_TOKEN";
 const MAX_IMAGE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 struct EmbeddedBuildContext {
@@ -91,6 +92,8 @@ fn build_image(image: &str, fingerprint: &str) -> Result<()> {
         .arg("build")
         .arg("--tag")
         .arg(image)
+        .arg("--build-arg")
+        .arg(format!("{CODEX_NPM_REFRESH_TOKEN_ARG}={built_at}"))
         .arg("--label")
         .arg(format!("{IMAGE_FINGERPRINT_LABEL}={fingerprint}"))
         .arg("--label")
