@@ -13,6 +13,48 @@ if [ "${CODEXBOX_PATH_PREFIX+x}" = x ]; then
     export PATH="${CODEXBOX_PATH_PREFIX}:$PATH"
 fi
 
+rewrite_root_home() {
+    passwd_path=${CODEXBOX_PASSWD_PATH:-/etc/passwd}
+    root_home=${HOME:-}
+
+    [ "$root_home" != "" ] || return 0
+    [ -f "$passwd_path" ] || return 0
+    [ -w "$passwd_path" ] || return 0
+
+    passwd_dir=$(dirname "$passwd_path")
+    passwd_tmp=$(mktemp "$passwd_dir/passwd.codexbox.XXXXXX")
+    cleanup_passwd_tmp() {
+        rm -f "$passwd_tmp"
+    }
+    trap cleanup_passwd_tmp EXIT HUP INT TERM
+
+    if ! awk -F: -v home="$root_home" '
+        BEGIN {
+            OFS = FS
+            found_root = 0
+        }
+        $1 == "root" {
+            $6 = home
+            found_root = 1
+        }
+        { print }
+        END {
+            if (!found_root) {
+                exit 1
+            }
+        }
+    ' "$passwd_path" > "$passwd_tmp"; then
+        echo "codexbox: failed to rewrite root home in $passwd_path" >&2
+        exit 1
+    fi
+
+    cat "$passwd_tmp" > "$passwd_path"
+    rm -f "$passwd_tmp"
+    trap - EXIT HUP INT TERM
+}
+
+rewrite_root_home
+
 merge_missing_tree() {
     src_dir=$1
     dest_dir=$2

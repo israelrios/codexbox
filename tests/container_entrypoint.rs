@@ -26,6 +26,59 @@ fn symlink_socket_fixture(path: &Path) -> UnixStream {
 }
 
 #[test]
+fn entrypoint_rewrites_root_home_before_inner_command() {
+    let dir = tempdir().unwrap();
+    let fake_bin = dir.path().join("fake-bin");
+    let home_dir = dir.path().join("home");
+    let runtime_dir = dir.path().join("runtime");
+    let socket_dir = runtime_dir.join("podman");
+    let passwd_path = dir.path().join("passwd");
+    let observed_home = dir.path().join("observed-root-home");
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+    fs::create_dir_all(&socket_dir).unwrap();
+    fs::write(
+        &passwd_path,
+        "root:x:0:0:root:/root:/bin/bash\nbin:x:1:1:bin:/bin:/sbin/nologin\n",
+    )
+    .unwrap();
+    let _socket = symlink_socket_fixture(&socket_dir.join("podman.sock"));
+
+    write_fake_podman(
+        &fake_bin.join("podman"),
+        r#"#!/bin/sh
+if [ "$1" = "system" ] && [ "$2" = "service" ]; then
+    exit 0
+fi
+exit 0
+"#,
+    );
+
+    let output = Command::new("/bin/sh")
+        .arg(entrypoint_path())
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("awk -F: '$1 == \"root\" { print $6 }' \"$CODEXBOX_PASSWD_PATH\" > \"$CODEXBOX_TEST_OBSERVED_HOME\"")
+        .env_clear()
+        .env("HOME", &home_dir)
+        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("CODEXBOX_PASSWD_PATH", &passwd_path)
+        .env("CODEXBOX_TEST_OBSERVED_HOME", &observed_home)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(&observed_home).unwrap(),
+        format!("{}\n", home_dir.display())
+    );
+    assert!(fs::read_to_string(&passwd_path)
+        .unwrap()
+        .contains(&format!("root:x:0:0:root:{}:/bin/bash", home_dir.display())));
+}
+
+#[test]
 fn entrypoint_fails_fast_when_podman_service_socket_never_appears() {
     let dir = tempdir().unwrap();
     let fake_bin = dir.path().join("fake-bin");
